@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from fastapi import HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,7 +38,8 @@ async def execute_command(
     if not key:
         raise HTTPException(status_code=400, detail={"code": "IDEMPOTENCY_KEY_REQUIRED", "message": "Idempotency-Key header is required."})
 
-    request_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    normalized_request = jsonable_encoder(payload)
+    request_hash = hashlib.sha256(json.dumps(normalized_request, sort_keys=True).encode()).hexdigest()
     existing = await db.scalar(
         select(IdempotencyRecord).where(
             IdempotencyRecord.tenant_id == actor.tenant_id,
@@ -66,6 +68,7 @@ async def execute_command(
     correlation_id = getattr(request.state, "correlation_id", request.headers.get("X-Correlation-Id", ""))
     try:
         response, resource_type, resource_id, aggregate_version = await action()
+        normalized_response = jsonable_encoder(response)
         db.add(AuditEntry(
             tenant_id=actor.tenant_id,
             actor_id=actor.subject,
@@ -81,14 +84,14 @@ async def execute_command(
             aggregate_type=resource_type,
             aggregate_id=resource_id,
             aggregate_version=aggregate_version,
-            payload=response,
+            payload=normalized_response,
             correlation_id=correlation_id,
             status="PENDING_CONFIGURATION",
         ))
         record.status = "COMPLETED"
-        record.response_json = response
+        record.response_json = normalized_response
         await db.commit()
-        return response
+        return normalized_response
     except Exception:
         await db.rollback()
         raise
