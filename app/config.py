@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     oidc_issuer: str = ""
     oidc_audience: str = ""
     oidc_algorithms: str = "RS256"
+    tracking_webhook_secret: str = ""
+
     capability_live_tender_send: bool = False
     capability_live_dispatch_notification: bool = False
     capability_email_live_send: bool = False
