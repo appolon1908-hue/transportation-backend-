@@ -1,0 +1,178 @@
+name: backend-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact main SHA or signed release tag to build
+        required: true
+        type: string
+      image_tag:
+        description: Human-readable immutable release tag (for example 2026.08.26-1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: freight-backend-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/freight-platform-backend
+
+jobs:
+  publish-attested-image:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production-release
+
+    steps:
+      - name: Validate requested release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.source_ref }}" =~ ^[0-9a-f]{40}$ || "${{ inputs.source_ref }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          [[ "${{ inputs.image_tag }}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{2,63}$ ]]
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require source to be on protected main or a signed release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [[ "${{ inputs.source_ref }}" =~ ^v ]]; then
+            git verify-tag "${{ inputs.source_ref }}"
+          else
+            test "$HEAD_SHA" = "${{ inputs.source_ref }}"
+            git merge-base --is-ancestor "$HEAD_SHA" origin/main
+          fi
+          test -z "$(git status --porcelain)"
+          echo "SOURCE_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: metadata
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=freight-platform-backend
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.vendor=Codestra
+
+      - name: Build and publish immutable multi-platform image
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: deploy/backend/Dockerfile.v4
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate reviewable SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: freight-platform-backend.spdx.json
+          upload-artifact: false
+
+      - name: Scan the published digest before attestation
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Keyless-sign the exact registry digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attach GitHub build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attach the reviewable SBOM attestation
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: freight-platform-backend.spdx.json
+          push-to-registry: true
+
+      - name: Write immutable release evidence
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          sbom = Path('freight-platform-backend.spdx.json')
+          evidence = {
+              'canonical_image': os.environ['IMAGE'],
+              'digest': os.environ['DIGEST'],
+              'source_sha': os.environ['SOURCE_SHA'],
+              'release_tag': '${{ inputs.image_tag }}',
+              'sbom_sha256': hashlib.sha256(sbom.read_bytes()).hexdigest(),
+              'deployment_performed': False,
+          }
+          Path('release-evidence.json').write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + '\n'
+          )
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freight-backend-release-${{ inputs.image_tag }}
+          path: |
+            freight-platform-backend.spdx.json
+            release-evidence.json
+            trivy-results.sarif
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Confirm release workflow stops before deployment
+        run: echo "Artifact published and attested; no staging or production deployment was executed."
