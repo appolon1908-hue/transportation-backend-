@@ -25,6 +25,12 @@ class BindingPatch(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class QuoteDecisionIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    decision: Literal["ACCEPT", "DECLINE"]
+    customer_note: str | None = Field(default=None, max_length=2_000)
+
+
 class ClaimSubmissionIn(BaseModel):
     shipment_id: UUID
     claim_type: Literal[
