@@ -29,6 +29,7 @@ jobs:
     env:
       ENVIRONMENT: development
       DATABASE_URL: postgresql+asyncpg://freight:freight@localhost:5432/freight
+      ALLOW_DEVELOPMENT_IDENTITY_HEADERS: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -41,19 +42,19 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Ruff
-        run: ruff check app tests migrations
+        run: ruff check app tests migrations scripts
 
       - name: Python syntax
-        run: python -m compileall -q app migrations tests
+        run: python -m compileall -q app migrations tests scripts
 
       - name: Migrate empty database to head
         run: alembic upgrade head
 
       - name: Migration head
-        run: test "$(alembic heads | awk '{print $1}')" = "0001_foundation"
+        run: test "$(alembic heads | awk '{print $1}')" = "0002b_identity_rbac_rls"
 
       - name: Tests
         run: pytest -q
 
       - name: OpenAPI smoke
-        run: python -c "from app.main import app; assert len(app.openapi()['paths']) >= 40"
+        run: python -c "from app.main import app; assert len(app.openapi()['paths']) >= 55"
