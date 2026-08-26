@@ -32,6 +32,13 @@ def _operations(schema: dict) -> list[tuple[str, str, dict]]:
     return result
 
 
+def _method_paths(schema: dict) -> set[tuple[str, str]]:
+    return {
+        (method.upper(), path)
+        for path, method, _operation in _operations(schema)
+    }
+
+
 def test_release_identity_is_consistent_across_entrypoints() -> None:
     backend = TestClient(app).get("/health/version")
     integrations = TestClient(integration_app).get("/health/version")
@@ -98,20 +105,34 @@ def test_openapi_documents_standard_bearer_security() -> None:
     assert "security" not in signed_webhook
 
 
-def test_production_openapi_contains_all_portal_and_integration_surfaces() -> None:
-    paths = set(app.openapi()["paths"])
+def test_production_openapi_contains_exact_portal_and_integration_contract() -> None:
+    operations = _method_paths(app.openapi())
     required = {
-        "/api/v1/admin/integrations/health",
-        "/api/v1/admin/integrations",
-        "/api/v1/admin/compliance/policies",
-        "/api/v1/admin/portal-bindings",
-        "/api/v1/admin/portal-reviews/claims",
-        "/api/v1/operations/control-tower",
-        "/api/v1/portals/customer/context",
-        "/api/v1/portals/customer/quotes/{quote_id}/decision",
-        "/api/v1/portals/carrier/context",
-        "/api/v1/portals/carrier/tenders/{tender_id}/response",
-        "/api/v1/portals/carrier/loads/{load_id}/tracking",
-        "/api/v1/integrations/{webhook_slug}/webhooks/{provider}",
+        ("GET", "/api/v1/admin/integrations/health"),
+        ("GET", "/api/v1/admin/integrations"),
+        ("POST", "/api/v1/admin/integrations"),
+        ("GET", "/api/v1/admin/compliance/policies"),
+        ("POST", "/api/v1/admin/compliance/policies"),
+        ("GET", "/api/v1/admin/portal-bindings"),
+        ("POST", "/api/v1/admin/portal-bindings"),
+        ("GET", "/api/v1/admin/portal-reviews/claims"),
+        ("PATCH", "/api/v1/admin/portal-reviews/claims/{submission_id}"),
+        ("GET", "/api/v1/admin/portal-reviews/carrier-evidence"),
+        ("PATCH", "/api/v1/admin/portal-reviews/carrier-evidence/{submission_id}"),
+        ("GET", "/api/v1/operations/control-tower"),
+        ("GET", "/api/v1/portals/customer/context"),
+        ("GET", "/api/v1/portals/customer/documents"),
+        ("POST", "/api/v1/portals/customer/quotes/{quote_id}/decision"),
+        ("GET", "/api/v1/portals/carrier/context"),
+        ("GET", "/api/v1/portals/carrier/documents"),
+        ("POST", "/api/v1/portals/carrier/tenders/{tender_id}/response"),
+        ("POST", "/api/v1/portals/carrier/loads/{load_id}/tracking"),
+        ("POST", "/api/v1/integrations/{webhook_slug}/webhooks/{provider}"),
     }
-    assert required <= paths
+    forbidden = {
+        ("POST", "/api/v1/admin/portal-reviews/claims/{submission_id}/decision"),
+        ("POST", "/api/v1/admin/portal-reviews/carrier-evidence/{submission_id}/decision"),
+    }
+
+    assert required <= operations
+    assert operations.isdisjoint(forbidden)
