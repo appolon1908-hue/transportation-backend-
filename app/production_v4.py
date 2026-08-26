@@ -8,9 +8,11 @@ from sqlalchemy.exc import IntegrityError
 from starlette.responses import JSONResponse
 
 from app.compliance.api import router as compliance_router
+from app.config import get_settings
 from app.gateway.middleware import SecurityHeadersMiddleware, TrustedGatewayMiddleware
 from app.production import app as app
 
+settings = get_settings()
 if not getattr(app.state, "freight_compliance_router_registered", False):
     app.include_router(compliance_router)
     app.state.freight_compliance_router_registered = True
@@ -59,5 +61,5 @@ async def _integrity_error_handler(request: Request, exc: IntegrityError) -> JSO
 
 
 app.add_exception_handler(IntegrityError, _integrity_error_handler)
-app.title = "Freight Platform API"
-app.version = "0.4.0"
+app.title = settings.app_name
+app.version = settings.app_version
