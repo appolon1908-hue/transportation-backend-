@@ -46,12 +46,12 @@ def upgrade() -> None:
             f"found {core_head!r}."
         )
     integration_table = bind.execute(
-    sa.text("SELECT to_regclass('public.integration_connections')")
-).scalar_one_or_none()
-if integration_table is None:
-    raise RuntimeError(
-        "Compliance migration requires canonical core integration tables."
-    )
+        sa.text("SELECT to_regclass('public.integration_connections')")
+    ).scalar_one_or_none()
+    if integration_table is None:
+        raise RuntimeError(
+            "Compliance migration requires canonical core integration tables."
+        )
 
     op.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
 
