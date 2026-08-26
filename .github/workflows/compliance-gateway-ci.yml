@@ -5,16 +5,22 @@ on:
     paths:
       - "app/compliance/**"
       - "app/gateway/**"
+      - "app/production.py"
       - "app/production_v4.py"
+      - "app/portals/**"
+      - "migrations/**"
       - "compliance_migrations/**"
       - "alembic-compliance.ini"
-      - "deploy/backend/**v4*"
+      - "deploy/backend/**"
       - "deploy/gateway/**"
       - "tests/test_compliance_gateway_contract.py"
+      - "tests/test_integrations_contract.py"
+      - "tests/test_release_readiness_contract.py"
       - ".github/workflows/compliance-gateway-ci.yml"
   push:
     branches:
       - "be/compliance-gateway-production-v4"
+      - "be/release-readiness-v6"
 
 permissions:
   contents: read
@@ -26,10 +32,10 @@ concurrency:
 jobs:
   compliance-and-gateway-contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     services:
       postgres:
-        image: postgis/postgis:16-3.4
+        image: postgis/postgis:17-3.5
         env:
           POSTGRES_USER: freight
           POSTGRES_PASSWORD: freight
@@ -40,11 +46,14 @@ jobs:
           --health-cmd "pg_isready -U freight -d freight"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 12
+          --health-retries 20
 
     env:
       ENVIRONMENT: test
       DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight
+      INGRESS_DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight
+      WORKER_DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight
+      ALLOW_DEVELOPMENT_IDENTITY_HEADERS: "true"
       OIDC_ISSUER: https://auth.codestra.co/realms/codestra
       OIDC_AUDIENCE: freight-platform-api
       OIDC_JWKS_URL: https://auth.codestra.co/realms/codestra/protocol/openid-connect/certs
@@ -68,50 +77,81 @@ jobs:
       - name: Compile hardened runtime
         run: >-
           python -m compileall -q
-          app/compliance app/gateway app/production_v4.py
-          integration_migrations compliance_migrations
-          tests/test_compliance_gateway_contract.py
+          app/compliance app/gateway app/portals app/production.py app/production_v4.py
+          migrations compliance_migrations workers
+          tests/test_integrations_contract.py tests/test_compliance_gateway_contract.py
 
-      - name: Apply core identity and tenancy schema
+      - name: Lint hardened runtime
+        run: >-
+          ruff check
+          app/compliance app/gateway app/portals app/production.py app/production_v4.py
+          migrations compliance_migrations workers
+          tests/test_integrations_contract.py tests/test_compliance_gateway_contract.py
+
+      - name: Apply canonical core schema
         run: alembic upgrade head
 
-      - name: Assert core migration head
-        run: test "$(alembic heads | awk '{print $1}')" = "0002_identity_tenancy"
-
-      - name: Apply durable integrations schema
-        run: alembic -c alembic-integrations.ini upgrade head
-
-      - name: Assert integrations migration head
-        run: test "$(alembic -c alembic-integrations.ini heads | awk '{print $1}')" = "0001_integrations_durability"
+      - name: Assert canonical core migration head
+        run: test "$(alembic heads | awk '{print $1}')" = "0005_portal_workflows"
 
       - name: Apply carrier compliance schema and database triggers
         run: alembic -c alembic-compliance.ini upgrade head
 
-      - name: Assert compliance migration head and SQL functions
+      - name: Assert compliance migration head SQL functions and RLS
+        env:
+          PGPASSWORD: freight
         run: |
           test "$(alembic -c alembic-compliance.ini heads | awk '{print $1}')" = "0001_carrier_readiness"
-          PGPASSWORD=freight psql -h 127.0.0.1 -U freight -d freight -v ON_ERROR_STOP=1 <<'SQL'
-          SELECT to_regprocedure('freight_carrier_readiness(uuid,uuid,text)') IS NOT NULL AS readiness_function_exists;
-          SELECT to_regprocedure('enforce_freight_carrier_readiness()') IS NOT NULL AS enforcement_function_exists;
+          psql -h 127.0.0.1 -U freight -d freight -v ON_ERROR_STOP=1 <<'SQL'
+          DO $block$
+          DECLARE
+              compliance_rls_count integer;
+          BEGIN
+              IF to_regprocedure('freight_carrier_readiness(uuid,uuid,text)') IS NULL THEN
+                  RAISE EXCEPTION 'readiness function missing';
+              END IF;
+              IF to_regprocedure('enforce_freight_carrier_readiness()') IS NULL THEN
+                  RAISE EXCEPTION 'readiness enforcement function missing';
+              END IF;
+              SELECT count(*) INTO compliance_rls_count
+              FROM pg_class
+              WHERE relname IN (
+                  'carrier_compliance_policies',
+                  'carrier_authority_records',
+                  'carrier_insurance_records',
+                  'carrier_safety_records',
+                  'carrier_compliance_overrides',
+                  'carrier_readiness_decisions'
+              ) AND relrowsecurity AND relforcerowsecurity;
+              IF compliance_rls_count <> 6 THEN
+                  RAISE EXCEPTION 'expected 6 FORCE RLS compliance tables, found %', compliance_rls_count;
+              END IF;
+          END;
+          $block$;
           SQL
 
-      - name: Run integration, compliance and gateway contracts
+      - name: Run integration compliance and gateway contracts
         run: pytest -q tests/test_integrations_contract.py tests/test_compliance_gateway_contract.py
 
       - name: Verify hardened production OpenAPI
         run: |
           python - <<'PY'
           from app.production_v4 import app
+
           schema = app.openapi()
           required = {
               "/api/v1/admin/integrations/health",
-              "/api/v1/webhooks/inbound/{provider}",
+              "/api/v1/integrations/{webhook_slug}/webhooks/{provider}",
               "/api/v1/admin/compliance/policies",
               "/api/v1/carriers/{carrier_id}/readiness/evaluate",
+              "/api/v1/admin/portal-bindings",
+              "/api/v1/operations/control-tower",
+              "/api/v1/portals/customer/context",
+              "/api/v1/portals/carrier/context",
           }
           missing = required - set(schema["paths"])
           assert not missing, missing
-          print("hardened OpenAPI surface verified")
+          print({"hardened_path_count": len(schema["paths"])})
           PY
 
       - name: Render and parse DB-less Kong configuration
@@ -130,6 +170,7 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import yaml
+
           path = Path('/tmp/freight-gateway/kong.yml')
           parsed = yaml.safe_load(path.read_text())
           assert parsed['_format_version'] == '3.0'
@@ -158,7 +199,11 @@ jobs:
           printf '%s' 'dummy' > /tmp/freight-gateway/integration.env
           export FREIGHT_BACKEND_IMAGE=ghcr.io/example/freight-platform-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           export DATABASE_URL="$DATABASE_URL"
-          export WORKER_DATABASE_URL="$DATABASE_URL"
+          export INGRESS_DATABASE_URL="$INGRESS_DATABASE_URL"
+          export WORKER_DATABASE_URL="$WORKER_DATABASE_URL"
+          export OIDC_ISSUER="$OIDC_ISSUER"
+          export OIDC_AUDIENCE="$OIDC_AUDIENCE"
+          export OIDC_JWKS_URL="$OIDC_JWKS_URL"
           export FORWARDED_ALLOW_IPS=10.40.0.0/24
           export TRUSTED_GATEWAY_CIDRS=10.40.0.0/24
           export GATEWAY_SHARED_SECRET_FILE=/tmp/freight-gateway/gateway-proof
