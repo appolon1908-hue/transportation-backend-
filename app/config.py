@@ -18,8 +18,10 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     app_name: str = "Freight Platform API"
-    app_version: str = "0.2.0"
+    app_version: str = "0.6.0"
     database_url: str = "postgresql+asyncpg://freight:freight@localhost:5432/freight"
+    ingress_database_url: str = ""
+    worker_database_url: str = ""
 
     allowed_hosts: str = "localhost,127.0.0.1,testserver"
     cors_origins: str = "http://localhost:5173"
@@ -54,6 +56,14 @@ class Settings(BaseSettings):
         return self.environment.strip().lower() == "production"
 
     @property
+    def resolved_ingress_database_url(self) -> str:
+        return self.ingress_database_url or self.database_url
+
+    @property
+    def resolved_worker_database_url(self) -> str:
+        return self.worker_database_url or self.database_url
+
+    @property
     def allowed_host_list(self) -> list[str]:
         return [value.strip() for value in self.allowed_hosts.split(",") if value.strip()]
 
@@ -75,6 +85,10 @@ class Settings(BaseSettings):
             return self.oidc_jwks_url
         return f"{self.oidc_issuer.rstrip('/')}/protocol/openid-connect/certs"
 
+    @staticmethod
+    def _database_username(value: str) -> str:
+        return urlparse(value).username or ""
+
     @model_validator(mode="after")
     def validate_runtime_contract(self) -> "Settings":
         allowed_algorithms = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
@@ -92,6 +106,9 @@ class Settings(BaseSettings):
                 "OIDC_ISSUER": self.oidc_issuer,
                 "OIDC_AUDIENCE": self.oidc_audience,
                 "ALLOWED_HOSTS": self.allowed_hosts,
+                "DATABASE_URL": self.database_url,
+                "INGRESS_DATABASE_URL": self.ingress_database_url,
+                "WORKER_DATABASE_URL": self.worker_database_url,
             }.items()
             if not value
         ]
@@ -107,6 +124,22 @@ class Settings(BaseSettings):
             raise ValueError("At least one OIDC algorithm is required")
         if urlparse(self.oidc_issuer).scheme != "https":
             raise ValueError("OIDC_ISSUER must use HTTPS in production")
+
+        database_urls = {
+            "api": self.database_url,
+            "ingress": self.ingress_database_url,
+            "worker": self.worker_database_url,
+        }
+        usernames = {
+            purpose: self._database_username(value)
+            for purpose, value in database_urls.items()
+        }
+        if any(not username for username in usernames.values()):
+            raise ValueError("Production database URLs must include explicit usernames")
+        if len(set(usernames.values())) != len(usernames):
+            raise ValueError(
+                "DATABASE_URL, INGRESS_DATABASE_URL and WORKER_DATABASE_URL must use distinct database users"
+            )
 
         live_effects = {
             "carrier.live_tender_send": self.capability_live_tender_send,
