@@ -23,7 +23,7 @@ ROUTERS = (
 )
 
 for router, sentinel_path in ROUTERS:
-    if not any(route.path == sentinel_path for route in app.routes):
+    if not any(getattr(route, "path", None) == sentinel_path for route in app.routes):
         app.include_router(router)
 
 app.title = "Freight Platform API"
