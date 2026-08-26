@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -42,7 +41,7 @@ def test_hardened_openapi_contains_compliance_and_integration_surfaces() -> None
     assert "/api/v1/admin/compliance/policies" in paths
     assert "/api/v1/carriers/{carrier_id}/readiness/evaluate" in paths
     assert "/api/v1/admin/integrations/health" in paths
-    assert "/api/v1/webhooks/inbound/{provider}" in paths
+    assert "/api/v1/integrations/{webhook_slug}/webhooks/{provider}" in paths
 
 
 def test_compliance_migration_enforces_database_boundary() -> None:
@@ -57,7 +56,11 @@ def test_compliance_migration_enforces_database_boundary() -> None:
     assert "OUT_OF_SERVICE" in migration
     assert "UNSATISFACTORY_SAFETY" in migration
     assert "FORCE ROW LEVEL SECURITY" in migration
-    assert "0001_integrations_durability" in migration
+    assert "TO freight_api" in migration
+    assert "TENANT_CONTEXT_MISMATCH" in migration
+    assert "0005_portal_workflows" in migration
+    assert "0001_integrations_durability" not in migration
+    assert "ADD CONSTRAINT IF NOT EXISTS" not in migration
 
 
 def test_kong_template_removes_spoofable_context_and_uses_redis_limits() -> None:
@@ -87,16 +90,18 @@ def test_caddy_is_the_only_public_gateway_and_limits_bodies() -> None:
     assert "published: 443" in compose
     assert "KONG_ADMIN_LISTEN: \"off\"" in compose
     assert "gateway_internal:\n    internal: true" in compose
-    assert "redis:" in compose and "ports:" not in compose.split("  redis:", 1)[1].split("  kong:", 1)[0]
+    redis_block = compose.split("  redis:", 1)[1].split("  kong:", 1)[0]
+    assert "redis:" in compose and "ports:" not in redis_block
 
 
-def test_backend_entrypoint_migrates_in_dependency_order() -> None:
+def test_backend_entrypoint_migrates_one_canonical_chain_before_compliance() -> None:
     entrypoint = (ROOT / "deploy/backend/entrypoint-v4.sh").read_text()
     core = entrypoint.index("alembic upgrade head")
-    integrations = entrypoint.index("alembic -c alembic-integrations.ini upgrade head")
     compliance = entrypoint.index("alembic -c alembic-compliance.ini upgrade head")
-    assert core < integrations < compliance
+    assert core < compliance
+    assert "alembic-integrations.ini" not in entrypoint
     assert "app.production_v4:app" in entrypoint
+    assert "workers.integration_worker" in entrypoint
 
 
 def test_release_composes_canonical_private_api_identity() -> None:
