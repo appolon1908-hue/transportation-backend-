@@ -64,7 +64,9 @@ def test_production_rejects_development_identity_headers() -> None:
     with pytest.raises(ValueError, match="ALLOW_DEVELOPMENT_IDENTITY_HEADERS"):
         Settings(
             environment="production",
-            database_url="postgresql+asyncpg://app:secret@db/freight",
+            database_url="postgresql+asyncpg://freight_api:secret@db/freight",
+            ingress_database_url="postgresql+asyncpg://freight_ingress:secret@db/freight",
+            worker_database_url="postgresql+asyncpg://freight_worker:secret@db/freight",
             oidc_issuer="https://auth.example.com/realms/freight",
             oidc_audience="freight-api",
             allowed_hosts="api.example.com",
