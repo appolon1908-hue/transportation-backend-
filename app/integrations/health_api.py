@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -20,9 +21,21 @@ _TERMINAL_FAILURE_STATUSES = {
     "DEAD",
     "DEAD_LETTER",
     "FAILED",
+    "FAILED_TERMINAL",
     "PERMANENT_FAILURE",
     "TERMINAL_FAILURE",
 }
+
+
+def count_terminal_failures(*status_counts: Mapping[str, int]) -> int:
+    """Count terminal states across independent queues without key collisions."""
+
+    return sum(
+        int(count)
+        for counts in status_counts
+        for status, count in counts.items()
+        if str(status).upper() in _TERMINAL_FAILURE_STATUSES
+    )
 
 
 @router.get("/admin/integrations/health")
@@ -70,13 +83,9 @@ async def integration_health(
     inbox_by_status = {
         str(status).upper(): int(count) for status, count in inbox_rows
     }
-    terminal_failures = sum(
-        count
-        for status, count in {
-            **deliveries_by_status,
-            **inbox_by_status,
-        }.items()
-        if status in _TERMINAL_FAILURE_STATUSES
+    terminal_failures = count_terminal_failures(
+        deliveries_by_status,
+        inbox_by_status,
     )
 
     return {
