@@ -31,6 +31,17 @@ be/api-contract-readiness-v1
      endpoint inventory and API contract tests
 ```
 
+## Operations and deployment-safety stack
+
+```text
+ops/secure-ci-deployment-scaffold-v1
+  └─ SHA-pinned CI actions, digest-pinned validation images, immutable release
+     inputs, fail-closed runtime-path evidence, Compose/gateway model hardening,
+     and proof that preflight cannot contact or mutate a live host
+```
+
+This operations branch targets `be/api-contract-readiness-v1`. It must not deploy, enable a capability, contain server-specific guesses, or absorb application feature work.
+
 ## Frontend stack
 
 ```text
@@ -61,6 +72,14 @@ be/integration-operations-hardening-v1
   command-backed dead-letter replay, delivery collision/concurrency hardening,
   operational audit and replay authorization
 
+be/database-credential-isolation-v1
+  process-specific database bootstrap, secret minimization and dedicated
+  migrator/API/ingress/worker credential boundaries
+
+be/dependency-lock-reproducibility-v1
+  hash-locked Python dependencies, deterministic wheelhouse and offline-
+  verifiable release builds
+
 be/observability-slo-v1
   metrics, traces, structured audit dashboards, alert rules and SLO evidence
 
@@ -77,3 +96,5 @@ fe/documents-workflows-v1
 5. Images are built only from the exact protected merged SHA.
 6. No feature branch may deploy or enable a live capability.
 7. Repository rename, workflow identity, image names and deployment references move in one controlled repository-identity change.
+8. Runtime-path evidence is committed separately from application source and reviewed by exact SHA.
+9. A successful read-only preflight is not deployment authorization.
