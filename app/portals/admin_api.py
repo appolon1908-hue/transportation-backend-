@@ -22,12 +22,14 @@ router = APIRouter(prefix="/api/v1/admin/portal-bindings", tags=["portal-admin"]
 
 
 def _trusted_issuers() -> set[str]:
-    configured = {
+    return {
         item.strip().rstrip("/")
-        for item in os.getenv("TRUSTED_OIDC_ISSUERS", os.getenv("OIDC_ISSUER", "")).split(",")
+        for item in os.getenv(
+            "TRUSTED_OIDC_ISSUERS",
+            os.getenv("OIDC_ISSUER", ""),
+        ).split(",")
         if item.strip()
     }
-    return configured
 
 
 async def _validate_resource(
@@ -52,25 +54,31 @@ async def _validate_resource(
 
 
 def _validate_binding_payload(payload: BindingIn | BindingPatch) -> None:
-    metadata = payload.metadata
-    if len(json.dumps(metadata, separators=(",", ":"), default=str).encode()) > 10_000:
+    if len(json.dumps(payload.metadata, separators=(",", ":"), default=str).encode()) > 10_000:
         raise HTTPException(
             status_code=422,
-            detail={"code": "METADATA_TOO_LARGE", "message": "Binding metadata exceeds 10 KB."},
+            detail={
+                "code": "METADATA_TOO_LARGE",
+                "message": "Binding metadata exceeds 10 KB.",
+            },
         )
 
 
 @router.get("")
 async def list_bindings(
     portal_kind: str | None = Query(default=None, pattern="^(CUSTOMER|CARRIER)$"),
-    binding_status: str | None = Query(default=None, alias="status", pattern="^(ACTIVE|SUSPENDED|REVOKED)$"),
+    binding_status: str | None = Query(
+        default=None,
+        alias="status",
+        pattern="^(ACTIVE|SUSPENDED|REVOKED)$",
+    ),
     principal_subject: str | None = Query(default=None, max_length=220),
     limit: int = Query(default=100, ge=1, le=200),
     cursor: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(get_actor),
 ):
-    actor.require("admin.users.manage")
+    actor.require("admin.identity.read")
     statement = select(PortalPrincipalBinding).where(
         PortalPrincipalBinding.tenant_id == actor.tenant_id
     )
@@ -102,7 +110,7 @@ async def create_binding(
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(get_actor),
 ):
-    actor.require("admin.users.manage")
+    actor.require("admin.identity.manage")
     _validate_binding_payload(payload)
     issuer = payload.principal_issuer.rstrip("/")
     trusted = _trusted_issuers()
@@ -122,6 +130,23 @@ async def create_binding(
     )
 
     async def action():
+        existing = await db.scalar(
+            select(PortalPrincipalBinding).where(
+                PortalPrincipalBinding.tenant_id == actor.tenant_id,
+                PortalPrincipalBinding.principal_issuer == issuer,
+                PortalPrincipalBinding.principal_subject == payload.principal_subject,
+                PortalPrincipalBinding.portal_kind == payload.portal_kind,
+            )
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PORTAL_BINDING_EXISTS",
+                    "message": "This principal already has a binding for the requested portal.",
+                    "binding_id": str(existing.id),
+                },
+            )
         item = PortalPrincipalBinding(
             tenant_id=actor.tenant_id,
             principal_issuer=issuer,
@@ -167,18 +192,23 @@ async def update_binding(
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(get_actor),
 ):
-    actor.require("admin.users.manage")
+    actor.require("admin.identity.manage")
     _validate_binding_payload(payload)
 
     async def action():
         item = await db.scalar(
-            select(PortalPrincipalBinding).where(
+            select(PortalPrincipalBinding)
+            .where(
                 PortalPrincipalBinding.id == binding_id,
                 PortalPrincipalBinding.tenant_id == actor.tenant_id,
             )
+            .with_for_update()
         )
         if item is None:
-            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Portal binding not found."})
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "NOT_FOUND", "message": "Portal binding not found."},
+            )
         if item.version != payload.expected_version:
             raise HTTPException(
                 status_code=412,
@@ -232,7 +262,7 @@ async def list_portal_access_audit(
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(get_actor),
 ):
-    actor.require("admin.users.manage")
+    actor.require("admin.audit.read")
     statement = select(PortalAccessAudit).where(
         PortalAccessAudit.tenant_id == actor.tenant_id
     )
@@ -241,7 +271,9 @@ async def list_portal_access_audit(
     if portal_kind:
         statement = statement.where(PortalAccessAudit.portal_kind == portal_kind)
     if principal_subject:
-        statement = statement.where(PortalAccessAudit.principal_subject == principal_subject)
+        statement = statement.where(
+            PortalAccessAudit.principal_subject == principal_subject
+        )
     items, next_cursor = await page_rows(
         db,
         statement=statement,
