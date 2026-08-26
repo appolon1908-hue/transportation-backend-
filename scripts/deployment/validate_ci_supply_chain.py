@@ -15,6 +15,11 @@ FORBIDDEN_REMOTE_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(ssh|scp|sftp|rsync|ansible-playbook|kubectl|helm)(?![A-Za-z0-9_-])",
     re.IGNORECASE,
 )
+REQUIRED_NODE24_ACTION_SHAS = {
+    "actions/checkout": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+    "actions/setup-python": "ece7cb06caefa5fff74198d8649806c4678c61a1",
+    "actions/upload-artifact": "b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+}
 
 
 class SupplyChainError(ValueError):
@@ -37,6 +42,11 @@ def _actions(path: Path, text: str) -> list[dict[str, str]]:
         if not SHA_RE.fullmatch(revision):
             raise SupplyChainError(
                 f"{path} action {action}@{revision} is not pinned to a full commit SHA"
+            )
+        required_sha = REQUIRED_NODE24_ACTION_SHAS.get(action)
+        if required_sha and revision != required_sha:
+            raise SupplyChainError(
+                f"{path} action {action} must use reviewed Node 24 SHA {required_sha}; got {revision}"
             )
         actions.append({"action": action, "sha": revision})
     if not actions:
