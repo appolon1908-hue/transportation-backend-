@@ -5,7 +5,7 @@ import re
 import time
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -23,29 +23,37 @@ from app.release import BACKEND_SERVICE_NAME, release_identity
 settings = get_settings()
 logger = logging.getLogger("freight.api")
 _correlation_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-_LEGACY_IDENTITY_PLACEHOLDER_PATHS = {
+_SUPERSEDED_CORE_ROUTE_PATHS = {
+    "/carriers/{carrier_id}/compliance",
+}
+_SUPERSEDED_EXTENDED_ROUTE_PATHS = {
     "/admin/users",
     "/admin/roles",
     "/admin/permissions",
     "/admin/capabilities",
     "/admin/capabilities/{code}",
+    "/integrations/tracking/{provider}/webhooks",
 }
 
 
-def _remove_legacy_identity_placeholders() -> None:
-    """Keep the persistent identity API authoritative at each method/path pair."""
+def _remove_superseded_routes(router: APIRouter, relative_paths: set[str]) -> None:
+    """Keep one authoritative owner for every production method/path pair."""
 
     retained = []
-    for route in extended_router.routes:
+    for route in router.routes:
         path = str(getattr(route, "path", ""))
         relative_path = path.removeprefix("/api/v1")
-        if relative_path in _LEGACY_IDENTITY_PLACEHOLDER_PATHS:
+        if relative_path in relative_paths:
             continue
         retained.append(route)
-    extended_router.routes[:] = retained
+    router.routes[:] = retained
 
 
-_remove_legacy_identity_placeholders()
+# The compliance and durable-integration routers provide the reviewed replacements
+# for these foundation routes. Mutate the shared router objects before production
+# composition so tests, OpenAPI, and runtime dispatch all observe the same owners.
+_remove_superseded_routes(core_router, _SUPERSEDED_CORE_ROUTE_PATHS)
+_remove_superseded_routes(extended_router, _SUPERSEDED_EXTENDED_ROUTE_PATHS)
 
 app = FastAPI(
     title=settings.app_name,
