@@ -34,8 +34,10 @@ jobs:
           --health-retries 20
 
     env:
-      ENVIRONMENT: development
+      ENVIRONMENT: test
       DATABASE_URL: postgresql+asyncpg://freight:freight@localhost:5432/freight
+      INGRESS_DATABASE_URL: postgresql+asyncpg://freight:freight@localhost:5432/freight
+      WORKER_DATABASE_URL: postgresql+asyncpg://freight:freight@localhost:5432/freight
       ALLOW_DEVELOPMENT_IDENTITY_HEADERS: "true"
       COMPLIANCE_IDENTIFIER_PEPPER: ci-only-pepper
       OIDC_ISSUER: https://auth.example.test/realms/freight
