@@ -1,0 +1,104 @@
+name: integrations-ci
+
+on:
+  pull_request:
+    paths:
+      - "app/integrations/**"
+      - "app/integrations_main.py"
+      - "workers/integration_worker.py"
+      - "migrations/versions/0003_integrations_durability.py"
+      - "tests/test_integrations_contract.py"
+      - "deploy/**"
+      - ".github/workflows/integrations-ci.yml"
+  push:
+    branches:
+      - "be/integrations-webhooks-provenance-v3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integrations-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: freight
+          POSTGRES_PASSWORD: freight
+          POSTGRES_DB: freight_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U freight -d freight_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight_test
+      OIDC_ISSUER: https://auth.example.test/realms/freight
+      OIDC_AUDIENCE: freight-api
+      OIDC_JWKS_URL: https://auth.example.test/realms/freight/protocol/openid-connect/certs
+      INTEGRATION_ALLOWED_HOSTS: localhost,127.0.0.1,odoo.internal.example,n8n.internal.example
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install application and validation tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install pip-audit
+
+      - name: Compile integration runtime
+        run: |
+          python -m compileall -q app/integrations app/integrations_main.py workers/integration_worker.py
+
+      - name: Lint integration runtime
+        run: |
+          ruff check app/integrations app/integrations_main.py workers/integration_worker.py tests/test_integrations_contract.py
+
+      - name: Dependency vulnerability audit
+        run: |
+          pip-audit --strict --desc
+
+      - name: Apply complete migration chain
+        run: |
+          alembic upgrade head
+          alembic current | tee /tmp/alembic-current.txt
+          grep -q "0003_integrations_durability" /tmp/alembic-current.txt
+
+      - name: Verify reversible additive migration
+        run: |
+          alembic downgrade 0002_identity_tenancy
+          alembic upgrade 0003_integrations_durability
+          alembic current | grep -q "0003_integrations_durability"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Verify worker entry point
+        run: python -m workers.integration_worker --mode all --once
+
+      - name: Reject committed credential values
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE --exclude-dir=.git --exclude='*.md' \
+            '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._-]{16,}|api[_-]?key[[:space:]]*=[[:space:]]*["'"'][^$][^"'"']{12,})' \
+            app workers deploy migrations tests; then
+            echo "Potential committed credential value detected" >&2
+            exit 1
+          fi
