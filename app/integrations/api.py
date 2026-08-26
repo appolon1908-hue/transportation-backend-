@@ -8,11 +8,11 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.commands import execute_command
-from app.db import get_db
+from app.db import get_db, get_ingress_db
 from app.integrations.models import (
     IntegrationConnection,
     IntegrationDelivery,
@@ -590,16 +590,43 @@ async def verify_provenance_chain(
     return {"valid": True, "checked": len(entries), "head_hash": previous_hash}
 
 
-async def _lookup_public_connection(db: AsyncSession, webhook_slug: str) -> IntegrationConnection:
+async def _lookup_public_connection(
+    db: AsyncSession, webhook_slug: str
+) -> IntegrationConnection:
+    resolved = (
+        await db.execute(
+            text(
+                "SELECT connection_id, tenant_id "
+                "FROM public.freight_resolve_webhook_connection(:webhook_slug)"
+            ),
+            {"webhook_slug": webhook_slug},
+        )
+    ).one_or_none()
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "WEBHOOK_NOT_FOUND",
+                "message": "Webhook endpoint not found.",
+            },
+        )
+    connection_id, tenant_id = resolved
+    await set_tenant_context(db, tenant_id, "webhook-ingress")
     item = await db.scalar(
         select(IntegrationConnection).where(
-            IntegrationConnection.webhook_slug == webhook_slug,
+            IntegrationConnection.id == connection_id,
+            IntegrationConnection.tenant_id == tenant_id,
             IntegrationConnection.enabled.is_(True),
         )
     )
     if item is None:
-        raise HTTPException(status_code=404, detail={"code": "WEBHOOK_NOT_FOUND", "message": "Webhook endpoint not found."})
-    await set_tenant_context(db, item.tenant_id)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "WEBHOOK_NOT_FOUND",
+                "message": "Webhook endpoint not found.",
+            },
+        )
     return item
 
 
@@ -640,7 +667,7 @@ async def receive_webhook(
     x_webhook_key_id: str = Header(alias="X-Webhook-Key-Id", min_length=1, max_length=120),
     x_webhook_signature: str = Header(alias="X-Webhook-Signature", min_length=16, max_length=300),
     x_event_type: str | None = Header(default=None, alias="X-Event-Type", max_length=180),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_ingress_db),
 ) -> dict[str, Any]:
     return await _receive_webhook(
         webhook_slug=webhook_slug,
@@ -665,7 +692,7 @@ async def receive_compatibility_tracking_webhook(
     x_webhook_key_id: str = Header(alias="X-Webhook-Key-Id", min_length=1, max_length=120),
     x_webhook_signature: str = Header(alias="X-Webhook-Signature", min_length=16, max_length=300),
     x_event_type: str | None = Header(default=None, alias="X-Event-Type", max_length=180),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_ingress_db),
 ) -> dict[str, Any]:
     return await _receive_webhook(
         webhook_slug=x_integration_slug,

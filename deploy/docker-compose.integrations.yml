@@ -23,7 +23,7 @@ services:
       - "${FREIGHT_ENV_FILE:-/etc/freight-platform/integrations.env}"
     environment:
       ENVIRONMENT: production
-      MIGRATION_HEAD: 0003_integrations_durability
+      MIGRATION_HEAD: 0005_portal_workflows
     expose:
       - "8081"
     networks:
@@ -56,11 +56,11 @@ services:
       - "${FREIGHT_ENV_FILE:-/etc/freight-platform/integrations.env}"
     environment:
       ENVIRONMENT: production
-      MIGRATION_HEAD: 0003_integrations_durability
+      MIGRATION_HEAD: 0005_portal_workflows
     networks:
       - freight_private
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; assert os.getenv('DATABASE_URL'); assert os.getenv('INTEGRATION_ALLOWED_HOSTS')"]
+      test: ["CMD", "python", "-c", "import os; assert os.getenv('WORKER_DATABASE_URL'); assert os.getenv('INTEGRATION_ALLOWED_HOSTS')"]
       interval: 30s
       timeout: 5s
       retries: 3

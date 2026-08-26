@@ -13,7 +13,8 @@ read_secret_into_env() {
     value="$(cat "$file_path")"
     case "$value" in
       *"
-"*|*""*)
+"*|*"
+"*)
         echo "secret file for $variable contains a newline" >&2
         exit 78
         ;;
@@ -22,6 +23,9 @@ read_secret_into_env() {
   fi
 }
 
+read_secret_into_env DATABASE_URL
+read_secret_into_env INGRESS_DATABASE_URL
+read_secret_into_env WORKER_DATABASE_URL
 read_secret_into_env GATEWAY_SHARED_SECRET
 read_secret_into_env COMPLIANCE_IDENTIFIER_PEPPER
 
@@ -31,7 +35,6 @@ shift || true
 case "$mode" in
   migrate)
     alembic upgrade head
-    alembic -c alembic-integrations.ini upgrade head
     alembic -c alembic-compliance.ini upgrade head
     ;;
   api)
@@ -42,7 +45,7 @@ case "$mode" in
       --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:?required}"
     ;;
   worker)
-    exec python -m app.integrations.worker "$@"
+    exec python -m workers.integration_worker "$@"
     ;;
   *)
     echo "unknown entrypoint mode: $mode" >&2

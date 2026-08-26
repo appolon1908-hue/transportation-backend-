@@ -1,7 +1,7 @@
 """Carrier compliance evidence, readiness policy and write-time enforcement.
 
 Revision ID: 0001_carrier_readiness
-Requires core 0002_identity_tenancy and integrations 0001_integrations_durability.
+Requires canonical core 0005_portal_workflows.
 """
 
 from __future__ import annotations
@@ -40,24 +40,18 @@ def _tenant_policy(table_name: str) -> None:
 def upgrade() -> None:
     bind = op.get_bind()
     core_head = bind.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one_or_none()
-    if core_head != "0002_identity_tenancy":
+    if core_head != "0005_portal_workflows":
         raise RuntimeError(
-            "Compliance migration requires core schema head 0002_identity_tenancy; "
+            "Compliance migration requires core schema head 0005_portal_workflows; "
             f"found {core_head!r}."
         )
     integration_table = bind.execute(
-        sa.text("SELECT to_regclass('public.alembic_version_integrations')")
-    ).scalar_one_or_none()
-    if integration_table is None:
-        raise RuntimeError("Compliance migration requires the integrations migration track.")
-    integration_head = bind.execute(
-        sa.text("SELECT version_num FROM alembic_version_integrations")
-    ).scalar_one_or_none()
-    if integration_head != "0001_integrations_durability":
-        raise RuntimeError(
-            "Compliance migration requires integration head 0001_integrations_durability; "
-            f"found {integration_head!r}."
-        )
+    sa.text("SELECT to_regclass('public.integration_connections')")
+).scalar_one_or_none()
+if integration_table is None:
+    raise RuntimeError(
+        "Compliance migration requires canonical core integration tables."
+    )
 
     op.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
 
@@ -251,6 +245,14 @@ def upgrade() -> None:
 
     for table_name in TENANT_TABLES:
         _tenant_policy(table_name)
+
+    op.execute(
+        sa.text(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "
+            + ", ".join(f'\"{name}\"' for name in TENANT_TABLES)
+            + " TO freight_api"
+        )
+    )
 
     op.execute(
         sa.text(

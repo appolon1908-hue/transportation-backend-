@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 revision = "0004_integration_rls_roles"
 down_revision = "0003_integrations_durability"
@@ -147,12 +148,12 @@ $roles$;
         sa.Column("webhook_slug", sa.String(120), primary_key=True),
         sa.Column(
             "connection_id",
-            sa.dialects.postgresql.UUID(as_uuid=True),
+            postgresql.UUID(as_uuid=True),
             sa.ForeignKey("integration_connections.id", ondelete="CASCADE"),
             nullable=False,
             unique=True,
         ),
-        sa.Column("tenant_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column(
             "updated_at",
