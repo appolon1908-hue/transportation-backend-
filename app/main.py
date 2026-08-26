@@ -16,11 +16,36 @@ from app.api import router as core_router
 from app.api_extended import router as extended_router
 from app.config import get_settings
 from app.db import SessionLocal
+from app.openapi_contract import install_openapi_contract
 from app.platform.router import router as platform_router
+from app.release import BACKEND_SERVICE_NAME, release_identity
 
 settings = get_settings()
 logger = logging.getLogger("freight.api")
 _correlation_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+_LEGACY_IDENTITY_PLACEHOLDER_PATHS = {
+    "/admin/users",
+    "/admin/roles",
+    "/admin/permissions",
+    "/admin/capabilities",
+    "/admin/capabilities/{code}",
+}
+
+
+def _remove_legacy_identity_placeholders() -> None:
+    """Keep the persistent identity API authoritative at each method/path pair."""
+
+    retained = []
+    for route in extended_router.routes:
+        path = str(getattr(route, "path", ""))
+        relative_path = path.removeprefix("/api/v1")
+        if relative_path in _LEGACY_IDENTITY_PLACEHOLDER_PATHS:
+            continue
+        retained.append(route)
+    extended_router.routes[:] = retained
+
+
+_remove_legacy_identity_placeholders()
 
 app = FastAPI(
     title=settings.app_name,
@@ -151,18 +176,19 @@ async def health_ready():
 
 @app.get("/health/version", tags=["health"])
 async def health_version():
-    import os
-
-    return {
-        "name": "freight-platform-backend",
-        "version": settings.app_version,
-        "git_sha": os.getenv("GIT_SHA", "unknown"),
-        "image_digest": os.getenv("IMAGE_DIGEST", "unknown"),
-        "migration_head": os.getenv("MIGRATION_HEAD", "0002_identity_tenancy"),
-    }
+    return release_identity(
+        service_name=BACKEND_SERVICE_NAME,
+        version=settings.app_version,
+        migration_head=settings.migration_head,
+    )
 
 
-# Identity routes intentionally precede the foundation's legacy placeholder routes.
+# Persistent identity routes intentionally precede the foundation API routes.
 app.include_router(platform_router)
 app.include_router(core_router)
 app.include_router(extended_router)
+install_openapi_contract(
+    app,
+    service_name=BACKEND_SERVICE_NAME,
+    migration_head=settings.migration_head,
+)
