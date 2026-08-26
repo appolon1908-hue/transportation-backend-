@@ -54,7 +54,11 @@ def test_release_topology_has_separate_database_trust_roles() -> None:
 def test_production_runtime_registers_all_portal_surfaces() -> None:
     from app.production import app
 
-    paths = {route.path for route in app.routes}
+    paths = {
+        path
+        for route in app.routes
+        if (path := getattr(route, "path", None)) is not None
+    }
     required = {
         "/api/v1/admin/portal-bindings",
         "/api/v1/admin/portal-reviews/claims",
