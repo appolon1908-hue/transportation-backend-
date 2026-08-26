@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Assignment, Capability, Document, Load
+from app.models import Capability, Document, Load
 from app.portals.models import PortalAccessAudit, PortalPrincipalBinding
 from app.security import Actor
 
@@ -24,7 +24,7 @@ def utcnow() -> datetime:
 
 def actor_issuer(actor: Actor) -> str:
     value = getattr(actor, "issuer", None)
-    return str(value or os.getenv("OIDC_ISSUER", "unknown-issuer"))
+    return str(value or os.getenv("OIDC_ISSUER", "unknown-issuer")).rstrip("/")
 
 
 def has_column(model: type, name: str) -> bool:
@@ -158,6 +158,13 @@ async def require_portal_binding(
     action: str,
     correlation_id: str,
 ) -> PortalPrincipalBinding:
+    required_permission = {
+        "CUSTOMER": "portal.customer",
+        "CARRIER": "portal.carrier",
+    }.get(portal_kind)
+    if required_permission:
+        actor.require(required_permission)
+
     if not await capability_is_enabled(db, actor.tenant_id, capability_code):
         await record_access(
             db,
@@ -267,26 +274,16 @@ async def carrier_load_ids(
     tenant_id: UUID,
     carrier_id: UUID,
 ) -> set[UUID]:
-    ids: set[UUID] = set()
-    if has_column(Load, "carrier_id"):
-        ids.update(
-            await db.scalars(
-                select(column(Load, "id")).where(
-                    column(Load, "tenant_id") == tenant_id,
-                    column(Load, "carrier_id") == carrier_id,
-                )
+    if not has_column(Load, "carrier_id"):
+        return set()
+    return set(
+        await db.scalars(
+            select(column(Load, "id")).where(
+                column(Load, "tenant_id") == tenant_id,
+                column(Load, "carrier_id") == carrier_id,
             )
         )
-    if has_column(Assignment, "carrier_id") and has_column(Assignment, "load_id"):
-        ids.update(
-            await db.scalars(
-                select(column(Assignment, "load_id")).where(
-                    column(Assignment, "tenant_id") == tenant_id,
-                    column(Assignment, "carrier_id") == carrier_id,
-                )
-            )
-        )
-    return ids
+    )
 
 
 async def documents_for_resources(
@@ -299,24 +296,24 @@ async def documents_for_resources(
 ) -> list[Document]:
     if not resource_ids:
         return []
-    required = {"tenant_id", "resource_id", "resource_type"}
-    if not required.issubset(set(Document.__table__.columns.keys())):
+    bounded = max(1, min(limit, 200))
+
+    if {"resource_id", "resource_type"}.issubset(Document.__table__.columns.keys()):
+        statement = select(Document).where(
+            column(Document, "tenant_id") == tenant_id,
+            column(Document, "resource_id").in_(resource_ids),
+            column(Document, "resource_type").in_(resource_types),
+        )
+    elif has_column(Document, "load_id"):
+        statement = select(Document).where(
+            column(Document, "tenant_id") == tenant_id,
+            column(Document, "load_id").in_(resource_ids),
+        )
+    else:
         return []
-    return list(
-        (
-            await db.scalars(
-                select(Document)
-                .where(
-                    column(Document, "tenant_id") == tenant_id,
-                    column(Document, "resource_id").in_(resource_ids),
-                    column(Document, "resource_type").in_(resource_types),
-                )
-                .order_by(
-                    column(Document, "created_at").desc()
-                    if has_column(Document, "created_at")
-                    else column(Document, "id").desc()
-                )
-                .limit(max(1, min(limit, 200)))
-            )
-        ).all()
-    )
+
+    if has_column(Document, "created_at"):
+        statement = statement.order_by(column(Document, "created_at").desc())
+    else:
+        statement = statement.order_by(column(Document, "id").desc())
+    return list((await db.scalars(statement.limit(bounded))).all())
