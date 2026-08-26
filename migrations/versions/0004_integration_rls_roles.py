@@ -90,6 +90,16 @@ def _tenant_expression() -> str:
     return "tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid"
 
 
+def _execute(sql: str) -> None:
+    """Execute exactly one top-level PostgreSQL statement.
+
+    asyncpg rejects prepared statements containing multiple top-level SQL
+    statements, even when PostgreSQL itself would accept the combined text.
+    """
+
+    op.execute(sa.text(sql))
+
+
 def _replace_policy(
     *,
     table_name: str,
@@ -98,23 +108,20 @@ def _replace_policy(
     using: str,
     with_check: str,
 ) -> None:
-    op.execute(sa.text(f'DROP POLICY IF EXISTS "{policy_name}" ON "{table_name}"'))
-    op.execute(
-        sa.text(
-            f'''CREATE POLICY "{policy_name}" ON "{table_name}"
-                TO "{role_name}"
-                USING ({using})
-                WITH CHECK ({with_check})'''
-        )
+    _execute(f'DROP POLICY IF EXISTS "{policy_name}" ON "{table_name}"')
+    _execute(
+        f'''CREATE POLICY "{policy_name}" ON "{table_name}"
+            TO "{role_name}"
+            USING ({using})
+            WITH CHECK ({with_check})'''
     )
 
 
 def upgrade() -> None:
     # These are NOLOGIN group roles. Deployment creates separate login users and
     # grants exactly one group role to each credential; no password is stored here.
-    op.execute(
-        sa.text(
-            r'''
+    _execute(
+        r'''
 DO $roles$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'freight_api') THEN
@@ -127,18 +134,15 @@ BEGIN
         CREATE ROLE freight_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOBYPASSRLS;
     END IF;
 END;
-$roles$;
+$roles$
 '''
-        )
     )
 
-    op.execute(sa.text("GRANT USAGE ON SCHEMA public TO freight_api, freight_ingress, freight_worker"))
-    op.execute(
-        sa.text(
-            f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {_quoted(API_DML_TABLES)} TO freight_api"
-        )
+    _execute("GRANT USAGE ON SCHEMA public TO freight_api, freight_ingress, freight_worker")
+    _execute(
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {_quoted(API_DML_TABLES)} TO freight_api"
     )
-    op.execute(sa.text("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO freight_api"))
+    _execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO freight_api")
 
     # A non-RLS route registry is intentionally narrow: it stores only an opaque
     # slug and UUIDs. Ingress can call the SECURITY DEFINER resolver but cannot
@@ -167,11 +171,10 @@ $roles$;
         "integration_webhook_routes",
         ["enabled", "webhook_slug"],
     )
-    op.execute(sa.text("REVOKE ALL ON TABLE integration_webhook_routes FROM PUBLIC"))
+    _execute("REVOKE ALL ON TABLE integration_webhook_routes FROM PUBLIC")
 
-    op.execute(
-        sa.text(
-            r'''
+    _execute(
+        r'''
 CREATE OR REPLACE FUNCTION public.freight_sync_webhook_route()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -197,17 +200,21 @@ BEGIN
         updated_at = timezone('utc', now());
     RETURN NEW;
 END;
-$function$;
-
-REVOKE ALL ON FUNCTION public.freight_sync_webhook_route() FROM PUBLIC;
-
-DROP TRIGGER IF EXISTS trg_integration_connection_webhook_route
-ON public.integration_connections;
-CREATE TRIGGER trg_integration_connection_webhook_route
-AFTER INSERT OR UPDATE OF webhook_slug, tenant_id, enabled OR DELETE
-ON public.integration_connections
-FOR EACH ROW EXECUTE FUNCTION public.freight_sync_webhook_route();
-
+$function$
+'''
+    )
+    _execute("REVOKE ALL ON FUNCTION public.freight_sync_webhook_route() FROM PUBLIC")
+    _execute(
+        "DROP TRIGGER IF EXISTS trg_integration_connection_webhook_route "
+        "ON public.integration_connections"
+    )
+    _execute(
+        "CREATE TRIGGER trg_integration_connection_webhook_route "
+        "AFTER INSERT OR UPDATE OR DELETE ON public.integration_connections "
+        "FOR EACH ROW EXECUTE FUNCTION public.freight_sync_webhook_route()"
+    )
+    _execute(
+        r'''
 INSERT INTO public.integration_webhook_routes (
     webhook_slug, connection_id, tenant_id, enabled, updated_at
 )
@@ -217,8 +224,11 @@ ON CONFLICT (connection_id) DO UPDATE SET
     webhook_slug = EXCLUDED.webhook_slug,
     tenant_id = EXCLUDED.tenant_id,
     enabled = EXCLUDED.enabled,
-    updated_at = timezone('utc', now());
-
+    updated_at = timezone('utc', now())
+'''
+    )
+    _execute(
+        r'''
 CREATE OR REPLACE FUNCTION public.freight_resolve_webhook_connection(p_webhook_slug text)
 RETURNS TABLE (connection_id uuid, tenant_id uuid)
 LANGUAGE sql
@@ -231,18 +241,21 @@ AS $function$
     WHERE route.webhook_slug = p_webhook_slug
       AND route.enabled
     LIMIT 1
-$function$;
-
-REVOKE ALL ON FUNCTION public.freight_resolve_webhook_connection(text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.freight_resolve_webhook_connection(text) TO freight_ingress;
+$function$
 '''
-        )
+    )
+    _execute(
+        "REVOKE ALL ON FUNCTION public.freight_resolve_webhook_connection(text) FROM PUBLIC"
+    )
+    _execute(
+        "GRANT EXECUTE ON FUNCTION public.freight_resolve_webhook_connection(text) "
+        "TO freight_ingress"
     )
 
     tenant_expression = _tenant_expression()
     for table_name in INTEGRATION_TABLES:
-        op.execute(sa.text(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY'))
-        op.execute(sa.text(f'ALTER TABLE "{table_name}" FORCE ROW LEVEL SECURITY'))
+        _execute(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY')
+        _execute(f'ALTER TABLE "{table_name}" FORCE ROW LEVEL SECURITY')
         _replace_policy(
             table_name=table_name,
             policy_name=f"{table_name}_api_tenant",
@@ -267,38 +280,30 @@ GRANT EXECUTE ON FUNCTION public.freight_resolve_webhook_connection(text) TO fre
             with_check=tenant_expression,
         )
 
-    op.execute(
-        sa.text(
-            "GRANT SELECT ON TABLE integration_connections, integration_webhook_keys, "
-            "integration_inbox_messages, integration_provenance_entries TO freight_ingress"
-        )
+    _execute(
+        "GRANT SELECT ON TABLE integration_connections, integration_webhook_keys, "
+        "integration_inbox_messages, integration_provenance_entries TO freight_ingress"
     )
-    op.execute(
-        sa.text(
-            "GRANT INSERT ON TABLE integration_inbox_messages, "
-            "integration_provenance_entries TO freight_ingress"
-        )
+    _execute(
+        "GRANT INSERT ON TABLE integration_inbox_messages, "
+        "integration_provenance_entries TO freight_ingress"
     )
 
-    op.execute(
-        sa.text(
-            f"GRANT SELECT, INSERT, UPDATE ON TABLE {_quoted(INTEGRATION_TABLES)} TO freight_worker"
-        )
+    _execute(
+        f"GRANT SELECT, INSERT, UPDATE ON TABLE {_quoted(INTEGRATION_TABLES)} TO freight_worker"
     )
-    op.execute(sa.text("GRANT SELECT, UPDATE ON TABLE outbox_messages TO freight_worker"))
-    op.execute(sa.text("GRANT SELECT ON TABLE capabilities, loads TO freight_worker"))
-    op.execute(
-        sa.text(
-            "GRANT SELECT, INSERT, UPDATE ON TABLE tracking_events, "
-            "operational_exceptions TO freight_worker"
-        )
+    _execute("GRANT SELECT, UPDATE ON TABLE outbox_messages TO freight_worker")
+    _execute("GRANT SELECT ON TABLE capabilities, loads TO freight_worker")
+    _execute(
+        "GRANT SELECT, INSERT, UPDATE ON TABLE tracking_events, "
+        "operational_exceptions TO freight_worker"
     )
 
     # The worker is not BYPASSRLS. Cross-tenant access exists only on the exact
     # queue/domain tables required for bounded claims and translations.
     for table_name in WORKER_CORE_TABLES:
-        op.execute(sa.text(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY'))
-        op.execute(sa.text(f'ALTER TABLE "{table_name}" FORCE ROW LEVEL SECURITY'))
+        _execute(f'ALTER TABLE "{table_name}" ENABLE ROW LEVEL SECURITY')
+        _execute(f'ALTER TABLE "{table_name}" FORCE ROW LEVEL SECURITY')
         _replace_policy(
             table_name=table_name,
             policy_name=f"{table_name}_worker_bounded",
@@ -310,30 +315,18 @@ GRANT EXECUTE ON FUNCTION public.freight_resolve_webhook_connection(text) TO fre
 
 def downgrade() -> None:
     for table_name in WORKER_CORE_TABLES:
-        op.execute(
-            sa.text(
-                f'DROP POLICY IF EXISTS "{table_name}_worker_bounded" ON "{table_name}"'
-            )
-        )
+        _execute(f'DROP POLICY IF EXISTS "{table_name}_worker_bounded" ON "{table_name}"')
 
     for table_name in INTEGRATION_TABLES:
         for suffix in ("api_tenant", "worker_bounded", "ingress_tenant"):
-            op.execute(
-                sa.text(
-                    f'DROP POLICY IF EXISTS "{table_name}_{suffix}" ON "{table_name}"'
-                )
-            )
+            _execute(f'DROP POLICY IF EXISTS "{table_name}_{suffix}" ON "{table_name}"')
 
-    op.execute(
-        sa.text(
-            r'''
-DROP TRIGGER IF EXISTS trg_integration_connection_webhook_route
-ON public.integration_connections;
-DROP FUNCTION IF EXISTS public.freight_resolve_webhook_connection(text);
-DROP FUNCTION IF EXISTS public.freight_sync_webhook_route();
-'''
-        )
+    _execute(
+        "DROP TRIGGER IF EXISTS trg_integration_connection_webhook_route "
+        "ON public.integration_connections"
     )
+    _execute("DROP FUNCTION IF EXISTS public.freight_resolve_webhook_connection(text)")
+    _execute("DROP FUNCTION IF EXISTS public.freight_sync_webhook_route()")
     op.drop_index(
         "ix_integration_webhook_routes_enabled",
         table_name="integration_webhook_routes",
