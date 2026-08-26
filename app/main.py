@@ -17,35 +17,37 @@ from app.api_extended import router as extended_router
 from app.config import get_settings
 from app.db import SessionLocal
 from app.openapi_contract import install_openapi_contract
+from app.operations.replay_api import router as operations_replay_router
 from app.platform.router import router as platform_router
 from app.release import BACKEND_SERVICE_NAME, release_identity
 
 settings = get_settings()
 logger = logging.getLogger("freight.api")
 _correlation_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-_LEGACY_IDENTITY_PLACEHOLDER_PATHS = {
+_LEGACY_EXTENDED_ROUTE_PATHS = {
     "/admin/users",
     "/admin/roles",
     "/admin/permissions",
     "/admin/capabilities",
     "/admin/capabilities/{code}",
+    "/operations/dead-letters/{message_id}/replay",
 }
 
 
-def _remove_legacy_identity_placeholders() -> None:
-    """Keep the persistent identity API authoritative at each method/path pair."""
+def _remove_superseded_extended_routes() -> None:
+    """Keep persistent identity and hardened recovery APIs authoritative."""
 
     retained = []
     for route in extended_router.routes:
         path = str(getattr(route, "path", ""))
         relative_path = path.removeprefix("/api/v1")
-        if relative_path in _LEGACY_IDENTITY_PLACEHOLDER_PATHS:
+        if relative_path in _LEGACY_EXTENDED_ROUTE_PATHS:
             continue
         retained.append(route)
     extended_router.routes[:] = retained
 
 
-_remove_legacy_identity_placeholders()
+_remove_superseded_extended_routes()
 
 app = FastAPI(
     title=settings.app_name,
@@ -183,8 +185,9 @@ async def health_version():
     )
 
 
-# Persistent identity routes intentionally precede the foundation API routes.
+# Persistent identity and hardened operational routes precede foundation routes.
 app.include_router(platform_router)
+app.include_router(operations_replay_router)
 app.include_router(core_router)
 app.include_router(extended_router)
 install_openapi_contract(
