@@ -11,8 +11,10 @@ from app.compliance.api import router as compliance_router
 from app.gateway.middleware import SecurityHeadersMiddleware, TrustedGatewayMiddleware
 from app.production import app as app
 
-if not any(route.path == "/api/v1/admin/compliance/policies" for route in app.routes):
+if not getattr(app.state, "freight_compliance_router_registered", False):
     app.include_router(compliance_router)
+    app.state.freight_compliance_router_registered = True
+    app.openapi_schema = None
 
 middleware_names = {item.cls.__name__ for item in app.user_middleware}
 if "SecurityHeadersMiddleware" not in middleware_names:
