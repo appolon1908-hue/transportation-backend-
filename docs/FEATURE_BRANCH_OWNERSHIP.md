@@ -29,6 +29,10 @@ be/fix-compliance-contract-gate-v1
 be/api-contract-readiness-v1
   └─ canonical release identity, OpenAPI security, duplicate-route removal,
      endpoint inventory and API contract tests
+
+be/integration-operations-hardening-v1
+  └─ command-backed dead-letter replay, row locking, idempotency, audit evidence
+     and replay event publication
 ```
 
 ## Frontend stack
@@ -56,10 +60,6 @@ Create these only with real implementation commits; do not create empty branches
 be/documents-secure-storage-v1
   object storage, presigned upload, checksum/content validation, malware scan,
   quarantine, retention and download authorization
-
-be/integration-operations-hardening-v1
-  command-backed dead-letter replay, delivery collision/concurrency hardening,
-  operational audit and replay authorization
 
 be/observability-slo-v1
   metrics, traces, structured audit dashboards, alert rules and SLO evidence
