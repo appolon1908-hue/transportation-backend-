@@ -1,216 +1,217 @@
 from __future__ import annotations
 
-import ipaddress
-import json
 import os
-import socket
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from app.integrations.crypto import SecretResolver, canonical_json, sha256_hex, signature_for
-from app.integrations.models import IntegrationConnection, OutboundDelivery
+from app.integrations.models import IntegrationConnection, IntegrationDelivery
+from app.integrations.security import (
+    canonical_json_bytes,
+    resolve_secret,
+    sha256_hex,
+    signed_headers,
+    validate_destination_url,
+)
 
 
 @dataclass(frozen=True)
 class DeliveryResult:
+    """Bounded delivery evidence returned to the durable worker.
+
+    Provider response bodies are never retained. Only a bounded hash, status and
+    a sanitized error classification cross the adapter boundary.
+    """
+
     success: bool
+    retryable: bool
     status_code: int | None
     response_hash: str | None
     error_code: str | None = None
     error_detail: str | None = None
+    duration_ms: int = 0
 
 
 class OutboundAdapter(Protocol):
     async def deliver(
         self,
-        *,
         connection: IntegrationConnection,
-        delivery: OutboundDelivery,
-        secret_resolver: SecretResolver,
+        delivery: IntegrationDelivery,
     ) -> DeliveryResult: ...
 
 
-def _allowed_hosts() -> set[str]:
-    return {
-        item.strip().lower()
-        for item in os.getenv("INTEGRATION_ALLOWED_HOSTS", "").split(",")
-        if item.strip()
-    }
+def event_envelope(delivery: IntegrationDelivery) -> dict[str, Any]:
+    """Return the canonical versioned, tenant-bound outbound event envelope."""
 
-
-def validate_destination_url(url: str) -> str:
-    parsed = urlparse(url)
-    environment = os.getenv("ENVIRONMENT", "development").lower()
-    if parsed.scheme not in ({"https"} if environment == "production" else {"http", "https"}):
-        raise ValueError("Integration destinations must use an approved HTTP scheme.")
-    if not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-        raise ValueError("Integration destination URL is invalid.")
-
-    host = parsed.hostname.lower()
-    if environment == "production":
-        allowed = _allowed_hosts()
-        if not allowed or host not in allowed:
-            raise ValueError("Integration destination host is not allowlisted.")
-    elif host not in {"localhost", "127.0.0.1", "::1"}:
-        # Development still rejects obviously unsafe metadata/link-local targets.
-        try:
-            addresses = {item[4][0] for item in socket.getaddrinfo(host, None)}
-        except socket.gaierror:
-            addresses = set()
-        for address in addresses:
-            ip = ipaddress.ip_address(address)
-            if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-                raise ValueError("Integration destination resolves to an unsafe address.")
-    return url
-
-
-def _bounded_response_hash(content: bytes) -> str:
-    return sha256_hex(content[:65536])
-
-
-def _event_envelope(delivery: OutboundDelivery) -> dict[str, Any]:
+    payload = dict(delivery.payload or {})
+    schema_version = str(payload.pop("schema_version", 1))
+    correlation_id = payload.pop("correlation_id", None)
+    occurred_at = payload.pop("occurred_at", None)
+    if occurred_at is None and getattr(delivery, "created_at", None) is not None:
+        occurred_at = delivery.created_at.isoformat()
     return {
         "id": str(delivery.event_id),
         "type": delivery.event_type,
-        "version": "1",
+        "version": schema_version,
         "tenant_id": str(delivery.tenant_id),
-        "correlation_id": delivery.correlation_id,
-        "data": delivery.payload,
+        "correlation_id": str(correlation_id) if correlation_id else None,
+        "occurred_at": occurred_at,
+        "data": payload,
     }
+
+
+def _bounded_response_hash(content: bytes) -> str:
+    return sha256_hex(content[:65_536])
+
+
+def _result_from_response(response: httpx.Response, started: float) -> DeliveryResult:
+    duration_ms = max(0, round((time.perf_counter() - started) * 1_000))
+    response_hash = _bounded_response_hash(response.content)
+    if 200 <= response.status_code < 300:
+        return DeliveryResult(
+            success=True,
+            retryable=False,
+            status_code=response.status_code,
+            response_hash=response_hash,
+            duration_ms=duration_ms,
+        )
+    retryable = response.status_code in {408, 409, 425, 429} or response.status_code >= 500
+    return DeliveryResult(
+        success=False,
+        retryable=retryable,
+        status_code=response.status_code,
+        response_hash=response_hash,
+        error_code="REMOTE_RETRYABLE" if retryable else "REMOTE_REJECTED",
+        error_detail=f"Destination returned HTTP {response.status_code}.",
+        duration_ms=duration_ms,
+    )
+
+
+def _configuration_error(exc: RuntimeError | ValueError, started: float) -> DeliveryResult:
+    duration_ms = max(0, round((time.perf_counter() - started) * 1_000))
+    return DeliveryResult(
+        success=False,
+        retryable=False,
+        status_code=None,
+        response_hash=None,
+        error_code=str(exc)[:120] or "CONFIGURATION_ERROR",
+        error_detail="Delivery configuration failed validation.",
+        duration_ms=duration_ms,
+    )
+
+
+def _network_error(exc: Exception, started: float) -> DeliveryResult:
+    duration_ms = max(0, round((time.perf_counter() - started) * 1_000))
+    return DeliveryResult(
+        success=False,
+        retryable=True,
+        status_code=None,
+        response_hash=None,
+        error_code="NETWORK_RETRYABLE",
+        error_detail=type(exc).__name__,
+        duration_ms=duration_ms,
+    )
+
+
+def _verify_tls_contract(connection: IntegrationConnection) -> None:
+    if os.getenv("ENVIRONMENT", "development").lower() == "production" and not connection.verify_tls:
+        raise ValueError("DESTINATION_TLS_VERIFICATION_REQUIRED")
 
 
 class SignedWebhookAdapter:
     async def deliver(
         self,
-        *,
         connection: IntegrationConnection,
-        delivery: OutboundDelivery,
-        secret_resolver: SecretResolver,
+        delivery: IntegrationDelivery,
     ) -> DeliveryResult:
-        config = connection.config or {}
-        path = str(config.get("path") or "")
-        if path.startswith("http://") or path.startswith("https://"):
-            return DeliveryResult(False, None, None, "INVALID_PATH", "Webhook path must be relative.")
-        target = validate_destination_url(urljoin(connection.base_url.rstrip("/") + "/", path.lstrip("/")))
-        envelope = _event_envelope(delivery)
-        body = canonical_json(envelope)
-        timestamp = str(int(__import__("time").time()))
-        secret = secret_resolver.resolve(connection.secret_ref)
-        signature = signature_for(secret, timestamp, body)
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "freight-platform-backend/1",
-            "X-Freight-Event-Id": str(delivery.event_id),
-            "X-Freight-Tenant-Id": str(delivery.tenant_id),
-            "X-Freight-Timestamp": timestamp,
-            "X-Freight-Key-Id": connection.signing_key_id or "default",
-            "X-Freight-Signature": signature,
-            "X-Correlation-Id": delivery.correlation_id,
-        }
+        started = time.perf_counter()
         try:
+            _verify_tls_contract(connection)
+            target = validate_destination_url(connection.base_url, connection.endpoint_path)
+            secret = resolve_secret(connection.signing_secret_ref)
+            body = canonical_json_bytes(event_envelope(delivery))
+            headers = signed_headers(
+                secret=secret,
+                key_id=connection.signing_key_id or "default",
+                event_id=str(delivery.event_id),
+                raw_body=body,
+            )
+            headers["User-Agent"] = "freight-platform-backend/1"
+            headers["X-Freight-Tenant-Id"] = str(delivery.tenant_id)
+            correlation_id = event_envelope(delivery).get("correlation_id")
+            if correlation_id:
+                headers["X-Correlation-Id"] = str(correlation_id)
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connection.timeout_seconds),
                 follow_redirects=False,
+                verify=connection.verify_tls,
             ) as client:
                 response = await client.post(target, content=body, headers=headers)
-            response_hash = _bounded_response_hash(response.content)
-            if 200 <= response.status_code < 300:
-                return DeliveryResult(True, response.status_code, response_hash)
-            retryable = response.status_code in {408, 409, 425, 429} or response.status_code >= 500
-            return DeliveryResult(
-                False,
-                response.status_code,
-                response_hash,
-                "REMOTE_RETRYABLE" if retryable else "REMOTE_REJECTED",
-                f"Destination returned HTTP {response.status_code}.",
-            )
+            return _result_from_response(response, started)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            return DeliveryResult(False, None, None, "NETWORK_RETRYABLE", type(exc).__name__)
+            return _network_error(exc, started)
         except (RuntimeError, ValueError) as exc:
-            return DeliveryResult(False, None, None, "CONFIGURATION_ERROR", str(exc))
+            return _configuration_error(exc, started)
 
 
 class N8nWebhookAdapter(SignedWebhookAdapter):
-    """n8n production webhooks use the same signed envelope contract.
-
-    The connection's base URL/path must point to the production webhook URL, never
-    the editor-only test URL.  n8n remains an orchestration consumer; it does not
-    become the source of freight business authority.
-    """
+    """n8n consumes the same signed durable envelope as generic webhooks."""
 
 
 class OdooJson2Adapter:
     async def deliver(
         self,
-        *,
         connection: IntegrationConnection,
-        delivery: OutboundDelivery,
-        secret_resolver: SecretResolver,
+        delivery: IntegrationDelivery,
     ) -> DeliveryResult:
-        config = connection.config or {}
-        model = str(config.get("model") or "").strip()
-        method = str(config.get("method") or "").strip()
-        argument_name = str(config.get("argument_name") or "event").strip()
-        if not model or not method or not argument_name:
-            return DeliveryResult(
-                False,
-                None,
-                None,
-                "CONFIGURATION_ERROR",
-                "Odoo JSON-2 model, method and argument_name are required.",
-            )
-
-        base = validate_destination_url(connection.base_url.rstrip("/") + "/")
-        target = validate_destination_url(urljoin(base, f"json/2/{model}/{method}"))
-        api_key = secret_resolver.resolve(connection.secret_ref)
-        body_value = {argument_name: _event_envelope(delivery)}
-        body = canonical_json(body_value)
-        headers = {
-            "Authorization": f"bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "freight-platform-backend/1",
-            "X-Correlation-Id": delivery.correlation_id,
-            "Idempotency-Key": str(delivery.id),
-        }
-        database = config.get("database")
-        if database:
-            headers["X-Odoo-Database"] = str(database)
-
+        started = time.perf_counter()
         try:
+            _verify_tls_contract(connection)
+            configuration = dict(connection.configuration or {})
+            model = str(configuration.get("model") or "").strip()
+            method = str(configuration.get("method") or "").strip()
+            argument_name = str(configuration.get("argument_name") or "event").strip()
+            endpoint_path = connection.endpoint_path
+            if not endpoint_path:
+                if not model or not method:
+                    raise ValueError("ODOO_JSON2_MODEL_METHOD_REQUIRED")
+                endpoint_path = f"json/2/{model}/{method}"
+            if not argument_name:
+                raise ValueError("ODOO_JSON2_ARGUMENT_NAME_REQUIRED")
+
+            target = validate_destination_url(connection.base_url, endpoint_path)
+            api_key = resolve_secret(connection.secret_ref)
+            body = canonical_json_bytes({argument_name: event_envelope(delivery)})
+            headers = {
+                "Authorization": f"bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "freight-platform-backend/1",
+                "Idempotency-Key": str(delivery.event_id),
+            }
+            correlation_id = event_envelope(delivery).get("correlation_id")
+            if correlation_id:
+                headers["X-Correlation-Id"] = str(correlation_id)
+            database = configuration.get("database")
+            if database:
+                headers["X-Odoo-Database"] = str(database)
+
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connection.timeout_seconds),
                 follow_redirects=False,
+                verify=connection.verify_tls,
             ) as client:
                 response = await client.post(target, content=body, headers=headers)
-            response_hash = _bounded_response_hash(response.content)
-            if 200 <= response.status_code < 300:
-                return DeliveryResult(True, response.status_code, response_hash)
-            retryable = response.status_code in {408, 409, 425, 429} or response.status_code >= 500
-            detail = "Odoo JSON-2 request failed."
-            if response.headers.get("content-type", "").startswith("application/json"):
-                try:
-                    parsed = response.json()
-                    detail = str(parsed.get("message") or parsed.get("error") or detail)[:500]
-                except (ValueError, AttributeError, TypeError):
-                    pass
-            return DeliveryResult(
-                False,
-                response.status_code,
-                response_hash,
-                "REMOTE_RETRYABLE" if retryable else "REMOTE_REJECTED",
-                detail,
-            )
+            return _result_from_response(response, started)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            return DeliveryResult(False, None, None, "NETWORK_RETRYABLE", type(exc).__name__)
+            return _network_error(exc, started)
         except (RuntimeError, ValueError) as exc:
-            return DeliveryResult(False, None, None, "CONFIGURATION_ERROR", str(exc))
+            return _configuration_error(exc, started)
 
 
 ADAPTERS: dict[str, OutboundAdapter] = {
-    "GENERIC_WEBHOOK": SignedWebhookAdapter(),
+    "SIGNED_WEBHOOK": SignedWebhookAdapter(),
     "N8N_WEBHOOK": N8nWebhookAdapter(),
     "ODOO_JSON2": OdooJson2Adapter(),
 }
@@ -218,6 +219,15 @@ ADAPTERS: dict[str, OutboundAdapter] = {
 
 def adapter_for(kind: str) -> OutboundAdapter:
     try:
-        return ADAPTERS[kind]
+        return ADAPTERS[kind.upper()]
     except KeyError as exc:
-        raise ValueError(f"Unsupported integration kind: {kind}") from exc
+        raise ValueError("UNSUPPORTED_INTEGRATION_KIND") from exc
+
+
+async def deliver(
+    connection: IntegrationConnection,
+    delivery: IntegrationDelivery,
+) -> DeliveryResult:
+    """Dispatch through the reviewed adapter selected by persisted connection kind."""
+
+    return await adapter_for(connection.kind).deliver(connection, delivery)
