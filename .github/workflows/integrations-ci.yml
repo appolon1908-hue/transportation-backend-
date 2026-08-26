@@ -3,16 +3,22 @@ name: integrations-ci
 on:
   pull_request:
     paths:
+      - "app/config.py"
+      - "app/db.py"
       - "app/integrations/**"
       - "app/integrations_main.py"
       - "workers/integration_worker.py"
       - "migrations/versions/0003_integrations_durability.py"
+      - "migrations/versions/0004_integration_rls_roles.py"
+      - "migrations/versions/0005_portal_workflows.py"
       - "tests/test_integrations_contract.py"
+      - "tests/test_release_readiness_contract.py"
       - "deploy/**"
       - ".github/workflows/integrations-ci.yml"
   push:
     branches:
       - "be/integrations-webhooks-provenance-v3"
+      - "be/release-readiness-v6"
 
 permissions:
   contents: read
@@ -24,10 +30,10 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     services:
       postgres:
-        image: postgis/postgis:16-3.4
+        image: postgis/postgis:17-3.5
         env:
           POSTGRES_USER: freight
           POSTGRES_PASSWORD: freight
@@ -43,6 +49,9 @@ jobs:
     env:
       ENVIRONMENT: test
       DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight_test
+      INGRESS_DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight_test
+      WORKER_DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight_test
+      ALLOW_DEVELOPMENT_IDENTITY_HEADERS: "true"
       OIDC_ISSUER: https://auth.example.test/realms/freight
       OIDC_AUDIENCE: freight-api
       OIDC_JWKS_URL: https://auth.example.test/realms/freight/protocol/openid-connect/certs
@@ -63,33 +72,67 @@ jobs:
           python -m pip install pip-audit
 
       - name: Compile integration runtime
-        run: |
-          python -m compileall -q app/integrations app/integrations_main.py workers/integration_worker.py
+        run: >-
+          python -m compileall -q
+          app/config.py app/db.py app/integrations app/integrations_main.py
+          workers/integration_worker.py migrations tests/test_integrations_contract.py
 
       - name: Lint integration runtime
-        run: |
-          ruff check app/integrations app/integrations_main.py workers/integration_worker.py tests/test_integrations_contract.py
+        run: >-
+          ruff check
+          app/config.py app/db.py app/integrations app/integrations_main.py
+          workers/integration_worker.py migrations/versions/0003_integrations_durability.py
+          migrations/versions/0004_integration_rls_roles.py
+          migrations/versions/0005_portal_workflows.py
+          tests/test_integrations_contract.py
 
       - name: Dependency vulnerability audit
-        run: |
-          pip-audit --strict --desc
+        run: pip-audit --strict --desc --skip-editable
 
-      - name: Apply complete migration chain
+      - name: Apply canonical migration chain
         run: |
           alembic upgrade head
           alembic current | tee /tmp/alembic-current.txt
-          grep -q "0003_integrations_durability" /tmp/alembic-current.txt
+          grep -q "0005_portal_workflows" /tmp/alembic-current.txt
 
-      - name: Verify reversible additive migration
+      - name: Verify integration security migrations are reversible
         run: |
-          alembic downgrade 0002_identity_tenancy
-          alembic upgrade 0003_integrations_durability
-          alembic current | grep -q "0003_integrations_durability"
+          alembic downgrade 0003_integrations_durability
+          alembic upgrade head
+          alembic current | grep -q "0005_portal_workflows"
+
+      - name: Verify RLS roles and opaque webhook resolver
+        env:
+          PGPASSWORD: freight
+        run: |
+          psql -h 127.0.0.1 -U freight -d freight_test -v ON_ERROR_STOP=1 <<'SQL'
+          DO $block$
+          DECLARE
+              role_count integer;
+              function_exists boolean;
+          BEGIN
+              SELECT count(*) INTO role_count
+              FROM pg_roles
+              WHERE rolname IN ('freight_api', 'freight_ingress', 'freight_worker')
+                AND NOT rolsuper
+                AND NOT rolbypassrls;
+              IF role_count <> 3 THEN
+                  RAISE EXCEPTION 'least-privilege integration roles are invalid';
+              END IF;
+
+              SELECT to_regprocedure('public.freight_resolve_webhook_connection(text)') IS NOT NULL
+              INTO function_exists;
+              IF NOT function_exists THEN
+                  RAISE EXCEPTION 'opaque webhook resolver is missing';
+              END IF;
+          END;
+          $block$;
+          SQL
 
       - name: Run tests
         run: pytest -q
 
-      - name: Verify worker entry point
+      - name: Verify canonical worker entry point
         run: python -m workers.integration_worker --mode all --once
 
       - name: Reject committed credential values
