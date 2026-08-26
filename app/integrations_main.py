@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from app.db import SessionLocal
 from app.integrations.api import router as integrations_router
+from app.integrations.health_api import router as integration_health_router
 
 app = FastAPI(
     title="Freight Platform Integration API",
@@ -98,4 +99,6 @@ async def health_version():
     }
 
 
+app.include_router(integration_health_router)
 app.include_router(integrations_router)
+app.openapi_schema = None
