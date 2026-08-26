@@ -5,9 +5,11 @@ import asyncio
 import logging
 import os
 import signal
-from collections.abc import Awaitable, Callable
 
-from app.db import SessionLocal
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import WorkerSessionLocal
 from app.integrations.service import (
     claim_delivery_batch,
     claim_inbox_batch,
@@ -28,8 +30,39 @@ def _signal_shutdown() -> None:
     _shutdown.set()
 
 
+async def _assert_worker_role(db: AsyncSession) -> None:
+    if os.getenv("ENVIRONMENT", "development").lower() != "production":
+        return
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                    current_user,
+                    current_setting('is_superuser') = 'on' AS is_superuser,
+                    role.rolbypassrls,
+                    pg_has_role(current_user, 'freight_worker', 'member') AS is_worker,
+                    pg_has_role(current_user, 'freight_api', 'member') AS is_api,
+                    pg_has_role(current_user, 'freight_ingress', 'member') AS is_ingress
+                FROM pg_roles AS role
+                WHERE role.rolname = current_user
+                """
+            )
+        )
+    ).one()
+    if row.is_superuser or row.rolbypassrls or not row.is_worker:
+        raise RuntimeError(
+            "Production worker must use a non-superuser NOBYPASSRLS login that is a member of freight_worker."
+        )
+    if row.is_api or row.is_ingress:
+        raise RuntimeError(
+            "Production worker credential must not inherit freight_api or freight_ingress."
+        )
+
+
 async def run_fanout() -> int:
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await _assert_worker_role(db)
         count = await fanout_outbox_batch(
             db, limit=int(os.getenv("INTEGRATION_FANOUT_BATCH_SIZE", "100"))
         )
@@ -38,13 +71,15 @@ async def run_fanout() -> int:
 
 
 async def run_delivery() -> int:
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await _assert_worker_role(db)
         claims = await claim_delivery_batch(
             db, limit=int(os.getenv("INTEGRATION_DELIVERY_BATCH_SIZE", "25"))
         )
     processed = 0
     for claim in claims:
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await _assert_worker_role(db)
             outcome = await process_claimed_delivery(
                 db, delivery_id=claim.delivery_id, claim_token=claim.claim_token
             )
@@ -58,13 +93,15 @@ async def run_delivery() -> int:
 
 
 async def run_inbox() -> int:
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await _assert_worker_role(db)
         claims = await claim_inbox_batch(
             db, limit=int(os.getenv("INTEGRATION_INBOX_BATCH_SIZE", "50"))
         )
     processed = 0
     for claim in claims:
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await _assert_worker_role(db)
             outcome = await process_claimed_inbox(
                 db, inbox_id=claim.inbox_id, claim_token=claim.claim_token
             )
@@ -102,6 +139,8 @@ async def main_async(mode: str, once: bool) -> None:
             processed = await run_cycle(mode)
         except Exception:
             logger.exception("integration_worker_cycle_failed mode=%s", mode)
+            if os.getenv("ENVIRONMENT", "development").lower() == "production":
+                raise
             processed = 0
         if once:
             return
