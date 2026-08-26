@@ -1,0 +1,176 @@
+name: compliance-gateway-ci
+
+on:
+  pull_request:
+    paths:
+      - "app/compliance/**"
+      - "app/gateway/**"
+      - "app/production_v4.py"
+      - "compliance_migrations/**"
+      - "alembic-compliance.ini"
+      - "deploy/backend/**v4*"
+      - "deploy/gateway/**"
+      - "tests/test_compliance_gateway_contract.py"
+      - ".github/workflows/compliance-gateway-ci.yml"
+  push:
+    branches:
+      - "be/compliance-gateway-production-v4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compliance-gateway-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compliance-and-gateway-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: freight
+          POSTGRES_PASSWORD: freight
+          POSTGRES_DB: freight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U freight -d freight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://freight:freight@127.0.0.1:5432/freight
+      OIDC_ISSUER: https://auth.codestra.co/realms/codestra
+      OIDC_AUDIENCE: freight-platform-api
+      OIDC_JWKS_URL: https://auth.codestra.co/realms/codestra/protocol/openid-connect/certs
+      INTEGRATION_ALLOWED_HOSTS: n8n.internal.example,odoo.internal.example
+      COMPLIANCE_IDENTIFIER_PEPPER: ci-only-pepper
+      PYTHONPATH: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package and validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pyyaml
+
+      - name: Compile hardened runtime
+        run: >-
+          python -m compileall -q
+          app/compliance app/gateway app/production_v4.py
+          integration_migrations compliance_migrations
+          tests/test_compliance_gateway_contract.py
+
+      - name: Apply core identity and tenancy schema
+        run: alembic upgrade head
+
+      - name: Assert core migration head
+        run: test "$(alembic heads | awk '{print $1}')" = "0002_identity_tenancy"
+
+      - name: Apply durable integrations schema
+        run: alembic -c alembic-integrations.ini upgrade head
+
+      - name: Assert integrations migration head
+        run: test "$(alembic -c alembic-integrations.ini heads | awk '{print $1}')" = "0001_integrations_durability"
+
+      - name: Apply carrier compliance schema and database triggers
+        run: alembic -c alembic-compliance.ini upgrade head
+
+      - name: Assert compliance migration head and SQL functions
+        run: |
+          test "$(alembic -c alembic-compliance.ini heads | awk '{print $1}')" = "0001_carrier_readiness"
+          PGPASSWORD=freight psql -h 127.0.0.1 -U freight -d freight -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT to_regprocedure('freight_carrier_readiness(uuid,uuid,text)') IS NOT NULL AS readiness_function_exists;
+          SELECT to_regprocedure('enforce_freight_carrier_readiness()') IS NOT NULL AS enforcement_function_exists;
+          SQL
+
+      - name: Run integration, compliance and gateway contracts
+        run: pytest -q tests/test_integrations_contract.py tests/test_compliance_gateway_contract.py
+
+      - name: Verify hardened production OpenAPI
+        run: |
+          python - <<'PY'
+          from app.production_v4 import app
+          schema = app.openapi()
+          required = {
+              "/api/v1/admin/integrations/health",
+              "/api/v1/webhooks/inbound/{provider}",
+              "/api/v1/admin/compliance/policies",
+              "/api/v1/carriers/{carrier_id}/readiness/evaluate",
+          }
+          missing = required - set(schema["paths"])
+          assert not missing, missing
+          print("hardened OpenAPI surface verified")
+          PY
+
+      - name: Render and parse DB-less Kong configuration
+        run: |
+          mkdir -p /tmp/freight-gateway
+          printf '%s' 'ci-gateway-proof-not-for-production' > /tmp/freight-gateway/gateway-proof
+          printf '%s' 'ci-redis-password-not-for-production' > /tmp/freight-gateway/redis-password
+          FRONTEND_ORIGIN=https://app.example.test \
+          KONG_REDIS_HOST=redis \
+          KONG_REDIS_PORT=6379 \
+          KONG_REDIS_DATABASE=0 \
+          GATEWAY_SHARED_SECRET_FILE=/tmp/freight-gateway/gateway-proof \
+          KONG_REDIS_PASSWORD_FILE=/tmp/freight-gateway/redis-password \
+          python deploy/gateway/render_config_v2.py \
+            deploy/gateway/kong.yml.template /tmp/freight-gateway/kong.yml
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+          path = Path('/tmp/freight-gateway/kong.yml')
+          parsed = yaml.safe_load(path.read_text())
+          assert parsed['_format_version'] == '3.0'
+          assert parsed['services']
+          assert '${' not in path.read_text()
+          print('Kong YAML syntax and placeholder resolution verified')
+          PY
+
+      - name: Validate Kong declarative schema
+        run: >-
+          docker run --rm
+          -v /tmp/freight-gateway/kong.yml:/tmp/kong.yml:ro
+          kong:3.9
+          kong config parse /tmp/kong.yml
+
+      - name: Validate Caddy configuration
+        run: >-
+          docker run --rm
+          -e API_DOMAIN=api.example.test
+          -v "$PWD/deploy/gateway/Caddyfile:/etc/caddy/Caddyfile:ro"
+          caddy:2-alpine
+          caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Validate production Compose models
+        run: |
+          printf '%s' 'dummy' > /tmp/freight-gateway/integration.env
+          export FREIGHT_BACKEND_IMAGE=ghcr.io/example/freight-platform-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          export DATABASE_URL="$DATABASE_URL"
+          export WORKER_DATABASE_URL="$DATABASE_URL"
+          export FORWARDED_ALLOW_IPS=10.40.0.0/24
+          export TRUSTED_GATEWAY_CIDRS=10.40.0.0/24
+          export GATEWAY_SHARED_SECRET_FILE=/tmp/freight-gateway/gateway-proof
+          export COMPLIANCE_IDENTIFIER_PEPPER_FILE=/tmp/freight-gateway/gateway-proof
+          export INTEGRATION_SECRETS_ENV_FILE=/tmp/freight-gateway/integration.env
+          export FREIGHT_BACKEND_NETWORK=freight_private
+          docker compose -f deploy/backend/compose.v4.yaml config -q
+
+          export GATEWAY_RENDERER_IMAGE=ghcr.io/example/freight-gateway-renderer@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          export REDIS_IMAGE=redis:7-alpine
+          export KONG_IMAGE=kong:3.9
+          export CADDY_IMAGE=caddy:2-alpine
+          export FRONTEND_ORIGIN=https://app.example.test
+          export KONG_REDIS_PASSWORD_FILE=/tmp/freight-gateway/redis-password
+          docker compose -f deploy/gateway/compose.gateway.yaml config -q
