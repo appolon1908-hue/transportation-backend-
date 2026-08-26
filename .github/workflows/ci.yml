@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - "be/release-readiness-v6"
+      - "be/api-contract-readiness-v1"
 
 permissions:
   contents: read
@@ -16,11 +17,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     services:
       postgres:
-        image: postgis/postgis:17-3.5
+        image: postgis/postgis:17-3.5@sha256:5c88b8231230b803d74220c62b56a577085466fc5880be98a1ab8195249a7ebb
         env:
           POSTGRES_DB: freight
           POSTGRES_USER: freight
@@ -45,8 +46,14 @@ jobs:
       INTEGRATION_ALLOWED_HOSTS: localhost,127.0.0.1,odoo.internal.example,n8n.internal.example
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install reviewed Python runtime
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
