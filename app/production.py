@@ -1,16 +1,30 @@
 """Production ASGI entrypoint.
 
-The foundation application remains unchanged for review continuity.  Production
-images import this module, which composes the reviewed core API with the durable
-integration endpoints.  Live outbound effects still require an enabled connection,
-an enabled subscription, and an explicitly enabled tenant capability.
+This composes the reviewed core API with durable integrations and the four portal
+surfaces. Live outbound effects and external portal access remain capability-gated
+and disabled by default.
 """
 
-from app.main import app as app
 from app.integrations.api import router as integration_router
+from app.main import app as app
+from app.portals.admin_api import router as portal_admin_router
+from app.portals.carrier_api import router as carrier_portal_router
+from app.portals.customer_api import router as customer_portal_router
+from app.portals.operations_api import router as operations_router
+from app.portals.review_api import router as portal_review_router
 
-if not any(route.path == "/api/v1/admin/integrations/health" for route in app.routes):
-    app.include_router(integration_router)
+ROUTERS = (
+    (integration_router, "/api/v1/admin/integrations/health"),
+    (portal_admin_router, "/api/v1/admin/portal-bindings"),
+    (portal_review_router, "/api/v1/admin/portal-reviews/claims"),
+    (operations_router, "/api/v1/operations/control-tower"),
+    (customer_portal_router, "/api/v1/portals/customer/context"),
+    (carrier_portal_router, "/api/v1/portals/carrier/context"),
+)
+
+for router, sentinel_path in ROUTERS:
+    if not any(route.path == sentinel_path for route in app.routes):
+        app.include_router(router)
 
 app.title = "Freight Platform API"
-app.version = "0.3.0"
+app.version = "0.6.0"
