@@ -30,19 +30,25 @@ jobs:
 
           path = Path("compliance_migrations/versions/0001_carrier_readiness.py")
           value = path.read_text()
-          broken = '''    integration_table = bind.execute(
-              sa.text("SELECT to_regclass('public.integration_connections')")
-          ).scalar_one_or_none()
-          if integration_table is None:
-              raise RuntimeError(
-                  "Compliance migration requires canonical core integration tables."
-              )
-          '''
-          # The previous automated rewrite lost indentation. Normalize the exact block.
+          block = "\n".join(
+              [
+                  "    integration_table = bind.execute(",
+                  "        sa.text(\"SELECT to_regclass('public.integration_connections')\")",
+                  "    ).scalar_one_or_none()",
+                  "    if integration_table is None:",
+                  "        raise RuntimeError(",
+                  "            \"Compliance migration requires canonical core integration tables.\"",
+                  "        )",
+                  "",
+                  "",
+              ]
+          )
           start = value.index("    integration_table = bind.execute(")
-          end = value.index("    op.execute(sa.text(\"CREATE EXTENSION IF NOT EXISTS pgcrypto\"))", start)
-          value = value[:start] + broken + "\n" + value[end:]
-          path.write_text(value)
+          end = value.index(
+              "    op.execute(sa.text(\"CREATE EXTENSION IF NOT EXISTS pgcrypto\"))",
+              start,
+          )
+          path.write_text(value[:start] + block + value[end:])
           Path(".github/workflows/fix-compliance-precondition.yml").unlink()
           PY
           python -m compileall -q compliance_migrations
