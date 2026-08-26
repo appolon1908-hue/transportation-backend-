@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import inspect
+
 from fastapi.testclient import TestClient
 
+from app.api import router as core_router
 from app.api_extended import router as extended_router
+from app.compliance.api import router as compliance_router
 from app.config import Settings
+from app.integrations.api import router as integration_router
+from app.integrations.health_api import router as integration_health_router
 from app.integrations_main import app as integration_app
+from app.platform.router import router as platform_router
+from app.portals.admin_api import router as portal_admin_router
+from app.portals.carrier_api import router as carrier_portal_router
+from app.portals.customer_api import router as customer_portal_router
+from app.portals.operations_api import router as portal_operations_router
+from app.portals.review_api import router as portal_review_router
 from app.production_v4 import app
 from app.release import (
     BACKEND_SERVICE_NAME,
@@ -21,6 +33,19 @@ _LEGACY_IDENTITY_PATHS = {
     "/api/v1/admin/capabilities",
     "/api/v1/admin/capabilities/{code}",
 }
+_PRODUCTION_ROUTERS = (
+    platform_router,
+    core_router,
+    extended_router,
+    integration_health_router,
+    integration_router,
+    compliance_router,
+    portal_admin_router,
+    portal_review_router,
+    portal_operations_router,
+    customer_portal_router,
+    carrier_portal_router,
+)
 
 
 def _operations(schema: dict) -> list[tuple[str, str, dict]]:
@@ -71,6 +96,52 @@ def test_legacy_admin_placeholders_are_not_registered() -> None:
     assert "list_users" in schema["paths"]["/api/v1/admin/users"]["get"]["operationId"]
     assert "list_roles" in schema["paths"]["/api/v1/admin/roles"]["get"]["operationId"]
     assert "list_permissions" in schema["paths"]["/api/v1/admin/permissions"]["get"]["operationId"]
+
+
+def test_registered_router_methods_are_unique() -> None:
+    owners: dict[tuple[str, str], str] = {}
+    duplicates: list[tuple[tuple[str, str], str, str]] = []
+
+    for router in _PRODUCTION_ROUTERS:
+        for route in router.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or set()
+            endpoint = getattr(route, "endpoint", None)
+            owner = (
+                f"{getattr(endpoint, '__module__', 'unknown')}."
+                f"{getattr(endpoint, '__name__', 'unknown')}"
+            )
+            if not path:
+                continue
+            for method in methods:
+                key = (str(method).upper(), str(path))
+                previous = owners.setdefault(key, owner)
+                if previous != owner:
+                    duplicates.append((key, previous, owner))
+
+    assert not duplicates, duplicates
+
+
+def test_registered_handlers_do_not_ship_not_implemented_responses() -> None:
+    findings: list[str] = []
+    forbidden = ("status_code=501", "HTTP_501_NOT_IMPLEMENTED", "NOT_IMPLEMENTED")
+
+    for router in _PRODUCTION_ROUTERS:
+        for route in router.routes:
+            endpoint = getattr(route, "endpoint", None)
+            if endpoint is None:
+                continue
+            try:
+                source = inspect.getsource(endpoint)
+            except (OSError, TypeError):
+                continue
+            if any(marker in source for marker in forbidden):
+                findings.append(
+                    f"{getattr(endpoint, '__module__', 'unknown')}."
+                    f"{getattr(endpoint, '__name__', 'unknown')}"
+                )
+
+    assert not findings, findings
 
 
 def test_openapi_has_unique_operation_ids_and_canonical_metadata() -> None:
