@@ -5,6 +5,7 @@ surfaces. Live outbound effects and external portal access remain capability-gat
 and disabled by default.
 """
 
+from app.config import get_settings
 from app.integrations.api import router as integration_router
 from app.integrations.health_api import router as integration_health_router
 from app.main import app as app
@@ -14,6 +15,7 @@ from app.portals.customer_api import router as customer_portal_router
 from app.portals.operations_api import router as operations_router
 from app.portals.review_api import router as portal_review_router
 
+settings = get_settings()
 ROUTERS = (
     integration_health_router,
     integration_router,
@@ -30,5 +32,5 @@ if not getattr(app.state, "freight_production_routers_registered", False):
     app.state.freight_production_routers_registered = True
     app.openapi_schema = None
 
-app.title = "Freight Platform API"
-app.version = "0.6.0"
+app.title = settings.app_name
+app.version = settings.app_version
