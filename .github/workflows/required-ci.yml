@@ -55,7 +55,8 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
           install -m 0755 "$RUNNER_TEMP/gitleaks" "$RUNNER_TEMP/gitleaks-bin"
       - name: Reject committed secrets
-        run: "$RUNNER_TEMP/gitleaks-bin" dir --no-banner --redact --exit-code 1 .
+        run: |
+          "$RUNNER_TEMP/gitleaks-bin" dir --no-banner --redact --exit-code 1 .
       - name: Run repository-aware CI
         run: |
           set -Eeuo pipefail
