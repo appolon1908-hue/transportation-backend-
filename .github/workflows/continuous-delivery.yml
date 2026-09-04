@@ -1,0 +1,142 @@
+name: Continuous delivery
+
+on:
+  push:
+    branches: [development, test, staging, production, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: delivery-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REPOSITORY_CLASS: backend
+  SOURCE_BRANCH: ${{ github.ref_name }}
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  deliver:
+    name: immutable-delivery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Restrict delivery to persistent branches
+        run: |
+          set -Eeuo pipefail
+          case "$SOURCE_BRANCH" in development|test|staging|production|main) ;; *) exit 1 ;; esac
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove exact clean checkout
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.14.0"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Validate release candidate
+        env:
+          SKIP_DOCKER_BUILD: "1"
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --no-input PyYAML==6.0.2
+          mkdir -p evidence
+          python scripts/ci/validate_repository.py --root . --mode release --branch "$SOURCE_BRANCH" --repository-class "$REPOSITORY_CLASS" --evidence evidence/release-validation.json
+      - name: Build deterministic delivery bundles
+        run: |
+          set -Eeuo pipefail
+          git archive --format=tar.gz --output=evidence/source.tar.gz HEAD
+          python - <<'PY'
+          import tarfile
+          from pathlib import Path
+          root = Path('.').resolve()
+          excluded = {'.git', 'node_modules', '.venv', '.venv-ci', '__pycache__'}
+          outputs = [p for p in root.rglob('*') if p.is_dir() and p.name in {'.output', 'dist', 'build'} and not any(x in excluded for x in p.parts)]
+          with tarfile.open('evidence/build-outputs.tar.gz', 'w:gz') as archive:
+              for path in sorted(set(outputs)):
+                  archive.add(path, arcname=path.relative_to(root))
+          PY
+      - name: Determine immutable image eligibility
+        id: image
+        run: |
+          set -Eeuo pipefail
+          dockerfile="$(find . -maxdepth 5 -type f -name Dockerfile -not -path './.git/*' | sort | head -n1 || true)"
+          reproducible=true
+          while IFS= read -r manifest; do
+            directory="$(dirname "$manifest")"
+            if [[ ! -f "$directory/package-lock.json" && ! -f "$directory/pnpm-lock.yaml" && ! -f "$directory/yarn.lock" ]]; then reproducible=false; fi
+          done < <(find . -maxdepth 5 -type f -name package.json -not -path '*/node_modules/*' -not -path './.git/*' | sort)
+          publish=false
+          case "$SOURCE_BRANCH" in staging|production|main) [[ -n "$dockerfile" && "$reproducible" == true ]] && publish=true ;; esac
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "reproducible=$reproducible" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_PUBLICATION=$publish"
+      - name: Build and publish immutable GHCR candidate
+        if: steps.image.outputs.publish == 'true'
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          DOCKERFILE: ${{ steps.image.outputs.dockerfile }}
+        run: |
+          set -Eeuo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          raw_name="${GITHUB_REPOSITORY#*/}"
+          name="$(printf '%s' "$raw_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[._-]+//; s/[._-]+$//')"
+          branch_tag="$(printf '%s' "$SOURCE_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')"
+          image="ghcr.io/${owner}/${name}:${branch_tag}-${SOURCE_SHA:0:12}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --pull=false --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${SOURCE_SHA}" -f "$DOCKERFILE" -t "$image" "$(dirname "$DOCKERFILE")"
+          docker push "$image" | tee "$RUNNER_TEMP/push.log"
+          digest="$(awk '/digest: sha256:/{print $3}' "$RUNNER_TEMP/push.log" | tail -n1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Finalize manifest and checksums
+        env:
+          IMAGE_REFERENCE: ${{ steps.publish.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          LOCKS_COMPLETE: ${{ steps.image.outputs.reproducible }}
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path('evidence')
+          payload = {
+              'schema_version': 1,
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'branch': os.environ['SOURCE_BRANCH'],
+              'source_sha': os.environ['SOURCE_SHA'],
+              'source_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'repository_class': os.environ['REPOSITORY_CLASS'],
+              'dependency_locks_complete': os.environ.get('LOCKS_COMPLETE') == 'true',
+              'image': os.environ.get('IMAGE_REFERENCE') or None,
+              'image_digest': os.environ.get('IMAGE_DIGEST') or None,
+              'artifact_checksums': {},
+              'runtime_deployment_authorized': False,
+              'external_effects_authorized': False,
+          }
+          for path in sorted(evidence.glob('*.tar.gz')):
+              payload['artifact_checksums'][path.name] = 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+          (evidence / 'release-manifest.json').write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+          PY
+          (cd evidence && find . -maxdepth 1 -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256 && sha256sum --check --strict checksums.sha256)
+      - name: Upload immutable delivery evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: delivery-${{ github.ref_name }}-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90
