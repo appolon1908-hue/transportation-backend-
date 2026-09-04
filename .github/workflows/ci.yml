@@ -1,0 +1,59 @@
+name: backend-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_DB: freight
+          POSTGRES_USER: freight
+          POSTGRES_PASSWORD: freight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U freight -d freight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+asyncpg://freight:freight@localhost:5432/freight
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check app tests migrations
+
+      - name: Python syntax
+        run: python -m compileall -q app migrations tests
+
+      - name: Migrate empty database to head
+        run: alembic upgrade head
+
+      - name: Migration head
+        run: test "$(alembic heads | awk '{print $1}')" = "0001_foundation"
+
+      - name: Tests
+        run: pytest -q
+
+      - name: OpenAPI smoke
+        run: python -c "from app.main import app; assert len(app.openapi()['paths']) >= 40"
